@@ -2794,6 +2794,218 @@
         }
     }
 
+    // Chrome 38 (media/formats/mp4/mp4_stream_parser.cc @38.0.2125.122) reads
+    // sample data at moof_position + trun.data_offset and parses truns with
+    // the LEGACY flag table (data-offset=0x1, first-sample-flags=0x4,
+    // duration=0x100, size=0x200, flags=0x400) as per-sample rows. Twitch's
+    // truns parse correctly under that table, but some custom-stack segments
+    // ship a track layout where the second track's data_offset overlaps the
+    // first track's data by a byte (audio sizes sum to N, video starts at
+    // N-1): every video sample then reads one byte early, the Annex-B length
+    // fields decode as garbage and the pipeline dies with MEDIA_ERR_DECODE,
+    // freezing all buffered ranges. Detect overlapping track runs per moof
+    // and shift the affected data_offsets so runs are contiguous. No-op for
+    // well-formed segments. Chrome 38 also hard-rejects tfhd with an explicit
+    // base-data-offset ("RCHECK(!(flags & 0x1))"), so offsets must stay
+    // moof-relative.
+    function mseRd32(v, o) {
+        return ((v[o] << 24) | (v[o + 1] << 16) | (v[o + 2] << 8) | v[o + 3]) >>> 0;
+    }
+    function mseWr32(v, o, n) {
+        v[o] = (n >>> 24) & 255;
+        v[o + 1] = (n >>> 16) & 255;
+        v[o + 2] = (n >>> 8) & 255;
+        v[o + 3] = n & 255;
+    }
+    function parseTrafRunForOverlap(v, trafOff, trafSize) {
+        var p = trafOff + 8;
+        var end = trafOff + trafSize;
+        var doVal = -1;
+        var doPos = -1;
+        var total = 0;
+        var trunCount = 0;
+        var g = 0;
+        while (p + 8 <= end && g++ < 8) {
+            var box = readBoxHeader(v, p);
+            if (!box) return null;
+            if (box.type === 'trun') {
+                trunCount++;
+                if (trunCount > 1) return null;
+                var version = v[p + 8];
+                var flags = ((v[p + 9] << 16) | (v[p + 10] << 8) | v[p + 11]) & 0xffffff;
+                if (version !== 0) return null;
+                var hasDo = (flags & 0x1) !== 0;
+                var hasFsf = (flags & 0x4) !== 0;
+                var hasDur = (flags & 0x100) !== 0;
+                var hasSize = (flags & 0x200) !== 0;
+                var hasFlags = (flags & 0x400) !== 0;
+                var hasCts = (flags & 0x800) !== 0;
+                if (!hasDo || !hasSize) return null;
+                var count = mseRd32(v, p + 12);
+                var row = (hasDur ? 4 : 0) + (hasSize ? 4 : 0) + (hasFlags ? 4 : 0) + (hasCts ? 4 : 0);
+                if (row === 0 || count === 0) return null;
+                var dataStart = p + 16 + (hasDo ? 4 : 0) + (hasFsf ? 4 : 0);
+                if (dataStart + row * count !== p + box.size) return null;
+                doVal = mseRd32(v, p + 16);
+                doPos = p + 16;
+                var sizeOff = hasDur ? 4 : 0;
+                var si;
+                for (si = 0; si < count; si++) {
+                    total += mseRd32(v, dataStart + si * row + sizeOff);
+                }
+            }
+            p += box.size;
+        }
+        if (trunCount !== 1 || doPos < 0) return null;
+        return {do: doVal, total: total, doPos: doPos};
+    }
+    function fixMseTrackOverlaps(buf) {
+        try {
+            if (!buf || buf.byteLength < 24) return buf;
+            var v = new Uint8Array(buf);
+            var o = 0;
+            var g = 0;
+            while (o + 8 <= v.length && g++ < 600) {
+                var box = readBoxHeader(v, o);
+                if (!box) return buf;
+                if (box.type === 'moof') {
+                    var entries = [];
+                    var p = o + box.hdr;
+                    var end = o + box.size;
+                    var g2 = 0;
+                    while (p + 8 <= end && g2++ < 30) {
+                        var b2 = readBoxHeader(v, p);
+                        if (!b2) return buf;
+                        if (b2.type === 'traf') {
+                            var info = parseTrafRunForOverlap(v, p, b2.size);
+                            if (!info) return buf; // unexpected layout: leave segment untouched
+                            entries.push(info);
+                        }
+                        p += b2.size;
+                    }
+                    if (entries.length > 1) {
+                        entries.sort(function (a, b) { return a.do - b.do; });
+                        var k;
+                        var fixed = 0;
+                        for (k = 1; k < entries.length; k++) {
+                            var prevEnd = entries[k - 1].do + entries[k - 1].total;
+                            if (entries[k].do < prevEnd) {
+                                mseWr32(v, entries[k].doPos, prevEnd);
+                                entries[k].do = prevEnd;
+                                fixed++;
+                            }
+                        }
+                        if (fixed > 0) bridgeDebugLog('mse_overlap_fixed', {runs: fixed});
+                    }
+                }
+                o += box.size;
+            }
+            return buf;
+        } catch (eFix) {
+            return buf;
+        }
+    }
+    // Track timescales (track id -> mdhd timescale) from an init segment.
+    function mseWalkFindTimescales(v) {
+        var out = {};
+        var walk = function (start, end, depth) {
+            if (depth > 6) return;
+            var p = start;
+            var g = 0;
+            while (p + 8 <= end && g++ < 500) {
+                var box = readBoxHeader(v, p);
+                if (!box) return;
+                if (box.type === 'trak') {
+                    var track = 0;
+                    var sc = 0;
+                    var q = p + box.hdr;
+                    var g2 = 0;
+                    while (q + 8 <= p + box.size && g2++ < 40) {
+                        var b2 = readBoxHeader(v, q);
+                        if (!b2) break;
+                        if (b2.type === 'tkhd') {
+                            var ver = v[q + b2.hdr];
+                            track = mseRd32(v, q + b2.hdr + (ver === 0 ? 12 : 20));
+                        } else if (b2.type === 'mdia') {
+                            var r = q + b2.hdr;
+                            var g3 = 0;
+                            while (r + 8 <= q + b2.size && g3++ < 40) {
+                                var b3 = readBoxHeader(v, r);
+                                if (!b3) break;
+                                if (b3.type === 'mdhd') {
+                                    var ver3 = v[r + b3.hdr];
+                                    sc = ver3 === 0 ? mseRd32(v, r + b3.hdr + 12) : mseRd32(v, r + b3.hdr + 20);
+                                }
+                                r += b3.size;
+                            }
+                        }
+                        q += b2.size;
+                    }
+                    if (track && sc) out[track] = sc;
+                }
+                if (box.type === 'moov' || box.type === 'trak' || box.type === 'mdia' || box.type === 'minf' || box.type === 'stbl') {
+                    walk(p + box.hdr, p + box.size, depth + 1);
+                }
+                p += box.size;
+            }
+        };
+        walk(0, v.length, 0);
+        return out;
+    }
+    // First-fragment media start in seconds (min over tracks of tfdt/timescale)
+    // from the init + first media segment. Used to shift MSE timestamps to a
+    // 0-based timeline (Twitch media often starts at an absolute offset while
+    // the app's resume seek, EXTINF duration and progress UI are 0-based).
+    function computeMediaStart(initBuf, mediaBuf) {
+        try {
+            if (!initBuf || !mediaBuf) return 0;
+            var tsMap = mseWalkFindTimescales(new Uint8Array(initBuf));
+            var v = new Uint8Array(mediaBuf);
+            var best = 0;
+            var o = 0;
+            var g = 0;
+            while (o + 8 <= v.length && g++ < 600) {
+                var box = readBoxHeader(v, o);
+                if (!box) return 0;
+                if (box.type === 'moof') {
+                    var p = o + box.hdr;
+                    var g2 = 0;
+                    while (p + 8 <= o + box.size && g2++ < 30) {
+                        var b2 = readBoxHeader(v, p);
+                        if (!b2) break;
+                        if (b2.type === 'traf') {
+                            var track = 0;
+                            var bmdt = 0;
+                            var q = p + b2.hdr;
+                            var g3 = 0;
+                            while (q + 8 <= p + b2.size && g3++ < 20) {
+                                var b3 = readBoxHeader(v, q);
+                                if (!b3) break;
+                                if (b3.type === 'tfhd') track = mseRd32(v, q + b3.hdr + 4);
+                                if (b3.type === 'tfdt') {
+                                    var ver = v[q + b3.hdr];
+                                    bmdt = ver === 1 ? Number(mseRd32(v, q + b3.hdr + 4)) * 4294967296 + mseRd32(v, q + b3.hdr + 8) : mseRd32(v, q + b3.hdr + 4);
+                                }
+                                q += b3.size;
+                            }
+                            var sc = tsMap[track];
+                            if (sc > 0 && bmdt > 0) {
+                                var secs = bmdt / sc;
+                                if (best === 0 || secs < best) best = secs;
+                            }
+                        }
+                        p += b2.size;
+                    }
+                    break;
+                }
+                o += box.size;
+            }
+            return Math.round(best * 1000) / 1000;
+        } catch (e) {
+            return 0;
+        }
+    }
+
     // Attaches the native HLS source to the main video (MPEG-TS channels).
     function attachNativeMain() {
         if (!mv) return;
@@ -2914,6 +3126,9 @@
             segs: parsed.segs,
             initUri: parsed.initUri || '',
             initPending: !!parsed.initUri,
+            initBytes: null,
+            pendingIsMedia: false,
+            offsetApplied: false,
             targetDur: parsed.targetDur || 6,
             durationMs: 0,
             nextIdx: 0,
@@ -3084,6 +3299,19 @@
         if (state.pending) {
             var buf = state.pending;
             state.pending = null;
+            if (state.pendingIsMedia && !state.offsetApplied && state.initBytes) {
+                // Shift the timeline to 0-based before the first media append:
+                // resume seeks, EXTINF duration and the progress UI are all
+                // 0-based, while Twitch tfdt often starts at an absolute value.
+                state.offsetApplied = true;
+                var mediaStart = computeMediaStart(state.initBytes, buf);
+                if (mediaStart > 0.001) {
+                    try {
+                        sb.timestampOffset = -mediaStart;
+                        bridgeDebugLog('mse_timestamp_offset', {seconds: mediaStart});
+                    } catch (eOff) {}
+                }
+            }
             try {
                 sb.appendBuffer(buf);
                 state.appendCount++;
@@ -3153,13 +3381,16 @@
             state.fetchFails = 0;
             if (state.initPending) {
                 state.initPending = false;
+                state.initBytes = data;
+                state.pendingIsMedia = false;
                 state.pending = sanitizeMseSegment(data);
                 msePump(state);
                 return;
             }
             state.lastUrl = seg.url;
             state.nextIdx = fetchIdx + 1;
-            state.pending = sanitizeMseSegment(data);
+            state.pendingIsMedia = true;
+            state.pending = fixMseTrackOverlaps(sanitizeMseSegment(data));
             msePump(state);
         });
     }

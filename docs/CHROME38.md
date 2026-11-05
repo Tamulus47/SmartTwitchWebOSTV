@@ -32,6 +32,17 @@ CDN dependencies (`firebase-app.js`, `firebase-analytics.js`, `gtag.js`) were au
 ES5-parsing; `firebase` init is additionally wrapped in `try/catch` upstream
 (`Main_Startfirebase` → `skipfirebase`).
 
+## Hosting (fork)
+
+The wrapper default (`webos/app/index.js`) points at
+`https://tamulus47.github.io/SmartTwitchWebOSTV/release/index.html` — this fork's GitHub
+Pages, built from the committed `release/` tree (synced from `npm run hosted:prepare`,
+which injects `githubio/js/webosCompatBridge.js` before `main.js`). The installed wrapper on
+the TV was updated from this tree; launches can still be overridden with a `params.target`
+(see `/tmp/tv_launch.sh` on the TV for the TV-local dev server, which also provides the
+`/sttv_proxy` route — on Pages that route does not exist, so only the live fMP4 segment
+path, which needs no proxy, would be available there).
+
 ## Quality gate
 
 ```bash
@@ -88,18 +99,37 @@ segment fetch via page XHR (live hosts `ACAO:*`) with `/sttv_proxy` fallback (VO
 control asset (Unified Streaming tears-of-steel fMP4) buffers with correct timing and no
 errors through the same pipeline.
 
-What remains unresolved: **Twitch's `trun` boxes are non-standard** — the payload is
-per-sample interleaved `[duration, size, flags]` (`dataLen == count*12` video / `count*8`
-audio, durations verified to sum exactly to the `tfdt` deltas) while the flags declare the
-canonical `first-sample-flags + dur (+ size)` layout. Chrome 38's spec-strict parser accepts
-the original timing (measured `buffered` span `62.03300-62.13300` = exactly the `tfdt` delta)
-but fails to decode (`err=3`) and rejects every subsequent fragment. Rewrites tested and
-failed (each changes behavior, none plays): explicit `base-data-offset`, append-start /
-moof-end relative `data_offset`, `styp` prefix, canonical trun flags `0x601`/`0x205`,
-audio-track + orphan `trex` stripping, per-sample flag sanitization, `data_offset±1`,
-fragment-by-fragment appends with long pacing. Determining Chrome 38's exact `trun`
-interpretation needs its source; until then fMP4 streams fail gracefully (the app returns to
-the list), while MPEG-TS channels — the majority — play normally.
+What remains unresolved: **decode of the first buffered frame fails at runtime** and static
+analysis has eliminated every bitstream cause. Established from Chrome 38's actual source
+(`chromium/chromium @38.0.2125.122`, `media/formats/mp4/box_definitions.cc`,
+`track_run_iterator.cc`, `mp4_stream_parser.cc`):
+
+- Chrome 38 uses the **legacy trun flag table** (`data-offset=0x1, first-sample-flags=0x4,
+  duration=0x100, size=0x200, flags=0x400`) and reads trun data as **per-sample rows**
+  `[dur][size][flags][cts]` — Twitch's truns (`0x301`/`0x701`) parse exactly correctly
+  under it (durations verified to sum to the `tfdt` deltas).
+- Sample data is read at `moof_queue_position + trun.data_offset` (moof-relative);
+  `tfhd` with an explicit `base-data-offset` is hard-rejected (`RCHECK(!(flags & 1))`),
+  which is why an explicit-base rewrite failed.
+- A faithful node port of these checks against the real VOD segments
+  (`tv_chrome38parse.js`) reports `ALL_CHECKS_PASS`, and a NAL walk at the exact
+  bytes Chrome 38 reads (`tv_nalwalk.js`) yields a perfect `SPS+PPS+IDR` frame.
+- `avcC` declares `Main@4.0` (`profile_indication=77`), `length_size=4` — matches the
+  declared `avc1.4D401F` mime; `isTypeSupported` = true.
+
+So the container, offsets, codec config and NAL framing are all provably correct, yet the
+element fires `MEDIA_ERR_DECODE` ~170ms after the first media append (a standard control
+asset, tears-of-steel, never reaches `readyState 2` either — no MSE frame has ever decoded
+on this browser). Progressive MP4 playback of the same codec works on this device (clips),
+so the failure is specific to Chrome 38's **MSE-side demux/decode pipeline** on webOS and
+needs `chrome://media-internals` logs (blocked by the TV browser) to go further.
+
+Implemented and verified while investigating: `timestampOffset` shift to a 0-based timeline
+(`mse_timestamp_offset` — buffered moves from `62.x` to `0.0`, aligning with EXTINF duration,
+resume seeks and the progress UI), a track-run overlap guard (`fixMseTrackOverlaps`,
+no-op on well-formed segments), and a format probe + MSE plumbing that is otherwise
+production-ready if the decode path is ever cracked.
 
 Test harnesses for this investigation live in the session helpers (`expr_*.js` run through
-`cdp_eval_sttv.py`, offline box inspectors `tv_boxes2.js`/`tv_trw.js`/`tv_init.js` on the TV).
+`cdp_eval_sttv.py`; offline validators `tv_chrome38parse.js`, `tv_nalwalk.js`,
+`tv_overlap.js`, `tv_boxes2.js`, `tv_init.js`, `tv_avcc.js` on the TV).
