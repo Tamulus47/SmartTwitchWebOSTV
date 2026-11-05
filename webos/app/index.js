@@ -1,7 +1,7 @@
 (function (global) {
     'use strict';
 
-    var DEFAULT_TARGET_URL = 'https://tbsniller.github.io/SmartTwitchWebOSTV/release/index.html';
+    var DEFAULT_TARGET_URL = 'https://tamulus47.github.io/SmartTwitchWebOSTV/release/index.html';
     var LAUNCH_TOKEN_PARAM = 'sttv_webos_launch';
     var launchHandlersInstalled = false;
     var launchBootstrapTimerId = 0;

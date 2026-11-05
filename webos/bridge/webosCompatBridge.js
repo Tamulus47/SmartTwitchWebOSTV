@@ -242,6 +242,8 @@
     var USHER_PLAYLIST_SERVICE_TIMEOUT_MS = 4500;      // Timeout for local service playlist fetch.
     var USHER_PLAYLIST_SERVICE_TIMEOUT_MIN_MS = 1200;  // Min allowed timeout sent to local service.
     var USHER_PLAYLIST_SERVICE_TIMEOUT_MAX_MS = 7000;  // Max allowed timeout sent to local service.
+    var USHER_PLAYLIST_SERVICE_COLD_GRACE_MS = 10000; // Extra bridge wait on first call: ls2 must spawn the node service process first.
+    var USHER_PLAYLIST_SERVICE_WARM_MARGIN_MS = 4000; // Bridge wait beyond the service's own deadline (DNS/TLS/fetch + luna delivery slack).
     var USHER_PLAYLIST_CACHE_TTL_MS = 45000;           // In-memory TTL for service-fetched playlists.
     var USHER_PLAYLIST_CACHE_MAX = 24;                 // Max cached service playlist entries.
     var USHER_PLAYLIST_INFLIGHT_MAX_AGE_MS = 20000;    // Safety prune age for stale in-flight entries.
@@ -266,6 +268,7 @@
     var usherPlaylistCacheByKey = {};         // Short-TTL in-memory playlist cache (service path).
     var usherPlaylistInFlightByKey = {};      // In-flight service fetch callbacks by request key.
     var usherPlaylistCorsFailureSeen = false; // Session flag: if true, skip doomed browser XHR on usher playlist.
+    var usherServiceWarm = false;            // True once the local HLS service answered at least once (node process spawned).
     // --- Loading indicator debounce ---
     // Loader show is delayed by DEBOUNCE_MS to prevent flicker on fast loads.
     // Loader hide is always immediate (canplay/playing/loadeddata events).
@@ -396,6 +399,10 @@
     }
     // Polyfills for ES6+ features missing on older webOS WebKit runtimes.
     // Android: modern WebView has these natively. webOS 3.x/4.x may not.
+    // CHROME38 (webOS 3.4 / Chrome 38 / V8 3.28): additionally provides the
+    // ES2015+ methods the upstream app calls at runtime. Feature-detected and
+    // ES5-only; see docs/CHROME38.md. Must run before main.js (script order
+    // in release/index.html is guaranteed by tools/upstream/prepareHostedRelease.js).
     function installLegacyRuntimePolyfills() {
         if (typeof w.globalThis === 'undefined') {
             w.globalThis = w;
@@ -408,6 +415,158 @@
                 return this.__sttvTarget;
             };
             w.WeakRef = WeakRefPolyfill;
+        }
+        // --- String.prototype (Chrome 41+) ---
+        if (!String.prototype.startsWith) {
+            String.prototype.startsWith = function (search, pos) {
+                pos = !pos || pos < 0 ? 0 : Number(pos);
+                return this.substring(pos, pos + search.length) === search;
+            };
+        }
+        if (!String.prototype.endsWith) {
+            String.prototype.endsWith = function (search, end) {
+                var endPosition = this.length;
+                if (typeof end === 'undefined' || end > endPosition) end = endPosition;
+                var startPosition = end - search.length;
+                return startPosition >= 0 && this.substr(startPosition, search.length) === search;
+            };
+        }
+        if (!String.prototype.includes) {
+            String.prototype.includes = function (search, start) {
+                if (typeof start !== 'number') start = 0;
+                return this.indexOf(search, start) !== -1;
+            };
+        }
+        if (!String.prototype.repeat) {
+            String.prototype.repeat = function (count) {
+                var str = String(this);
+                var result = '';
+                var n = count;
+                if (n < 0 || n === Infinity) throw new RangeError('Invalid count value');
+                n = Math.floor(n);
+                if (str.length === 0 || n === 0) return '';
+                while (n > 0) {
+                    if (n % 2 === 1) result += str;
+                    if (n > 1) str += str;
+                    n = Math.floor(n / 2);
+                }
+                return result;
+            };
+        }
+        if (!String.prototype.padStart) {
+            String.prototype.padStart = function (targetLength, padString) {
+                var str = String(this);
+                var pad = padString === undefined || padString === '' ? ' ' : String(padString);
+                var length = targetLength >> 0;
+                var padLength = length - str.length;
+                if (padLength <= 0) return str;
+                var repeated = '';
+                while (repeated.length < padLength) repeated += pad;
+                return repeated.substr(0, padLength) + str;
+            };
+        }
+        if (!String.prototype.padEnd) {
+            String.prototype.padEnd = function (targetLength, padString) {
+                var str = String(this);
+                var pad = padString === undefined || padString === '' ? ' ' : String(padString);
+                var length = targetLength >> 0;
+                var padLength = length - str.length;
+                if (padLength <= 0) return str;
+                var repeated = '';
+                while (repeated.length < padLength) repeated += pad;
+                return str + repeated.substr(0, padLength);
+            };
+        }
+        // --- Array.prototype (Chrome 45/47+) ---
+        if (!Array.prototype.includes) {
+            Array.prototype.includes = function (searchElement, fromIndex) {
+                var o = Object(this);
+                var len = o.length >>> 0;
+                if (len === 0) return false;
+                var n = fromIndex | 0;
+                if (n < 0) n = Math.max(len + n, 0);
+                while (n < len) {
+                    if (o[n] === searchElement) return true;
+                    n++;
+                }
+                return false;
+            };
+        }
+        if (!Array.prototype.find) {
+            Array.prototype.find = function (predicate, thisArg) {
+                if (this === null || typeof this === 'undefined') throw new TypeError('Array.prototype.find called on null or undefined');
+                if (typeof predicate !== 'function') throw new TypeError('predicate must be a function');
+                var value;
+                var list = Object(this);
+                var length = list.length >>> 0;
+                for (var i = 0; i < length; i++) {
+                    value = list[i];
+                    if (predicate.call(thisArg, value, i, list)) return value;
+                }
+                return undefined;
+            };
+        }
+        if (!Array.prototype.findIndex) {
+            Array.prototype.findIndex = function (predicate, thisArg) {
+                if (this === null || typeof this === 'undefined') throw new TypeError('Array.prototype.findIndex called on null or undefined');
+                if (typeof predicate !== 'function') throw new TypeError('predicate must be a function');
+                var list = Object(this);
+                var length = list.length >>> 0;
+                for (var i = 0; i < length; i++) {
+                    if (predicate.call(thisArg, list[i], i, list)) return i;
+                }
+                return -1;
+            };
+        }
+        // --- Object statics (Chrome 45/54+) ---
+        if (typeof Object.assign !== 'function') {
+            Object.assign = function (target) {
+                if (target === null || typeof target === 'undefined') throw new TypeError('Cannot convert undefined or null to object');
+                var to = Object(target);
+                for (var i = 1; i < arguments.length; i++) {
+                    var source = arguments[i];
+                    if (source === null || typeof source === 'undefined') continue;
+                    for (var key in source) {
+                        if (Object.prototype.hasOwnProperty.call(source, key)) to[key] = source[key];
+                    }
+                }
+                return to;
+            };
+        }
+        if (typeof Object.values !== 'function') {
+            Object.values = function (obj) {
+                if (obj === null || typeof obj === 'undefined') throw new TypeError('Cannot convert undefined or null to object');
+                var vals = [];
+                for (var key in obj) {
+                    if (Object.prototype.hasOwnProperty.call(obj, key)) vals.push(obj[key]);
+                }
+                return vals;
+            };
+        }
+        if (typeof Object.entries !== 'function') {
+            Object.entries = function (obj) {
+                if (obj === null || typeof obj === 'undefined') throw new TypeError('Cannot convert undefined or null to object');
+                var entries = [];
+                for (var key in obj) {
+                    if (Object.prototype.hasOwnProperty.call(obj, key)) entries.push([key, obj[key]]);
+                }
+                return entries;
+            };
+        }
+        // --- DOM helpers (Chrome 41+) ---
+        if (w.Element && w.Element.prototype && !w.Element.prototype.closest) {
+            w.Element.prototype.closest = function (selector) {
+                var element = this;
+                var matches = element.matches || element.msMatchesSelector || element.webkitMatchesSelector;
+                while (element) {
+                    if (matches.call(element, selector)) return element;
+                    element = element.parentElement;
+                }
+                return null;
+            };
+        }
+        if (w.NodeList && w.NodeList.prototype && !w.NodeList.prototype.forEach) {
+            w.NodeList.prototype.forEach = Array.prototype.forEach;
         }
     }
     // =========================================================================
@@ -740,10 +899,16 @@
     // Calls a named function from the upstream app with arguments.
     function call(n, a) {
         var f = fn(n);
-        if (typeof f !== 'function') return null;
+        if (typeof f !== 'function') {
+            bridgeDebugLog('app_call_missing', {name: n || ''});
+            return null;
+        }
         try {
             return f.apply(w, a || []);
         } catch (e) {
+            // App exceptions would otherwise vanish here; surface them in debug
+            // mode so playback failures can be traced to the throwing callback.
+            bridgeDebugLog('app_call_exception', {name: n || '', error: String((e && e.message) || e)});
             return null;
         }
     }
@@ -1317,6 +1482,7 @@
                 mainLastProgressWallMs = Date.now();
             }
             maybeAutoClearMainLoading('timeupdate', 300);
+            if (mse && !mse.dead) msePump(mse);
         });
         // progress: new data downloaded. Opportunistically hides loader.
         mv.addEventListener('progress', function () {
@@ -1331,6 +1497,7 @@
         mv.addEventListener('seeking', function () {
             requestMainLoadingShow();
             scheduleMainStallCheck();
+            if (mse && !mse.dead) mseHandleSeek(mse);
         });
         // waiting: playback stalled (buffer underrun). Show loader unless user-paused.
         mv.addEventListener('waiting', function () {
@@ -1366,6 +1533,14 @@
         });
         // error: playback error. Retry up to 2x, then escalate to upstream failure handler.
         mv.addEventListener('error', function () {
+            bridgeDebugLog('main_video_error', {
+                code: mv && mv.error ? mv.error.code : 0,
+                rs: mv ? mv.readyState : -1,
+                mseActive: mseActive(),
+                blob: mse && mse.blobUrl ? mse.blobUrl.substring(0, 60) : '',
+                msReady: mse && mse.ms ? String(mse.ms.readyState) : 'none',
+                src: String((mv && (mv.currentSrc || mv.src)) || '').substring(0, 60)
+            });
             clearMainStallTimer();
             clearMainDecoderJamRecoveryTimer();
             setMainLoading(false);
@@ -1464,6 +1639,7 @@
     // Android: ExoPlayer.release() or ExoPlayer.stop(). webOS: pause + remove src + hide.
     function clear(v) {
         if (!v) return;
+        if (v === mv) stopMse();
         try { v.pause(); } catch (e) {}
         try { v.removeAttribute('src'); v.load(); } catch (e2) {}
         hide(v);
@@ -1511,6 +1687,15 @@
         out.seekEndSeconds = 0;
         out.useSeekableWindow = false;
         if (!video) return out;
+        // MSE VOD: the element duration stays Infinity until endOfStream, so
+        // report the full playlist duration instead of the append window.
+        if (video === mv && mse && !mse.dead && mse.durationMs > 0) {
+            var mct = parseFloat(video.currentTime);
+            out.durationMs = mse.durationMs;
+            out.positionMs = isFinite(mct) && mct > 0 ? Math.floor(mct * 1000) : 0;
+            if (out.positionMs > out.durationMs) out.positionMs = out.durationMs;
+            return out;
+        }
         var rawDuration = parseFloat(video.duration);
         if (isFinite(rawDuration) && rawDuration > 0) {
             out.durationMs = Math.floor(rawDuration * 1000);
@@ -2018,6 +2203,21 @@
     function retryMainPlayback() {
         if (!isMainActive() || !mv) return false;
         if (isVideoPausedByUser(mv)) return false;
+        if (mseActive()) {
+            // MSE owns the pipeline: mv.load() would detach the MediaSource.
+            // Re-drive the pump and re-arm the stall check; progress events
+            // reset mainErrorCount, so only a persistently dead pump fails.
+            clearMainDecoderJamRecoveryTimer();
+            mainErrorCount += 1;
+            if (mainErrorCount >= 3) {
+                handleMainPlaybackFailure(1, 0);
+                return false;
+            }
+            requestMainLoadingShow();
+            msePump(mse);
+            scheduleMainStallCheck();
+            return true;
+        }
         var now = Date.now();
         if (mainLastHardReloadMs > 0 && now - mainLastHardReloadMs > HARD_RELOAD_COOLDOWN_WINDOW_MS) {
             mainHardReloadCount = 0;
@@ -2288,7 +2488,7 @@
         resetMainRecoveryState();
         requestMainLoadingShow();
         ms.type = t || 1;
-        ms.rawUri = u || '';
+        ms.rawUri = limitUsherCodecs(u || '');
         ms.playlist = pl || '';
         ms.q = parseQ(ms.playlist, ms.rawUri);
         ms.qp = -1;
@@ -2300,12 +2500,8 @@
             firstQuality: ms.q[0] && ms.q[0].id ? ms.q[0].id : ''
         });
         ms.uri = sourceFromQuality(ms, mainMaxRes);
-        if (mv) {
-            mv.src = ms.uri;
-            applyMainLayout();
-            show(mv);
-            try { mv.load(); } catch (e) {}
-        }
+        mainStreamFormat = null; // new stream: segment format unknown until probed
+        startMainPlayback();
         // Align with Android PlayerActivity.onTracksChanged: refresh quality list
         // for main player (live/vod) when not in PiP/multistream mode.
         if (ms.type < 3 && !w.PlayExtra_PicturePicture && !w.Play_MultiEnable) {
@@ -2348,7 +2544,7 @@
         ensurePreview();
         requestFeedLoadingShow();
         ps.type = type;
-        ps.rawUri = rawUri;
+        ps.rawUri = limitUsherCodecs(rawUri);
         ps.playlist = pl || '';
         ps.q = parseQ(ps.playlist, ps.rawUri);
         ps.qp = -1;
@@ -2375,6 +2571,690 @@
         }
         return true;
     }
+    // =========================================================================
+    // MSE fMP4 Main Player (webOS 3.4 / Chrome 38)
+    // =========================================================================
+    // Chrome 38's native HLS demuxer only understands MPEG-TS segments. Twitch
+    // channels on custom transcode stacks serve fMP4 segments (#EXT-X-MAP +
+    // .mp4): the bytes download but never decode (MEDIA_ERR_DECODE, readyState
+    // stuck at 1, videoWidth 0). MSE on this browser does support fMP4
+    // (MediaSource.isTypeSupported('video/mp4; codecs="avc1..."') === true), so
+    // for those streams we parse the media playlist ourselves and pump init +
+    // media segments into a SourceBuffer.
+    // Playlists are fetched through the local luna service (usher and variant
+    // playlist hosts omit CORS headers for our origin: XHR status 0 / 403);
+    // segments are fetched by page XHR (live segment hosts answer ACAO:*) with
+    // a same-origin /sttv_proxy fallback for VOD hosts that send no ACAO.
+    // MPEG-TS channels keep the untouched native path.
+    var mse = null; // Active MSE playback state, or null while native.
+    var mainStreamFormat = null; // Segment format of the current stream: null|'ts'|'fmp4'.
+    var mainDetectGen = 0; // Bumped per startMainPlayback; probes check against it.
+    var MSE_POLL_INTERVAL_MS = 3000; // Live playlist refresh period.
+    var MSE_BUFFER_TARGET_SECONDS = 45; // Append this far ahead of the playhead.
+    var MSE_BUFFER_KEEP_SECONDS = 30; // Trim to this much behind the playhead.
+    var MSE_PROBE_TIMEOUT_MS = 3000; // Playlist fetch timeout; must stay under the 8s stall window.
+    var MSE_SEGMENT_MAX_FAILS = 4; // Segment failures before restarting the pipeline.
+    var MSE_DEFAULT_MAX_RES = 480; // Default MSE quality cap when the app has not picked one yet.
+
+    function mseActive() {
+        return !!mse && !mse.dead;
+    }
+
+    // Tears down the MSE pipeline: timers, in-flight XHR, SourceBuffer, blob.
+    // The video element itself is handled by the caller (clear()/src swap).
+    function stopMse() {
+        var state = mse;
+        if (!state) return;
+        mse = null;
+        state.dead = true;
+        if (state.pollTimer) {
+            w.clearTimeout(state.pollTimer);
+            state.pollTimer = 0;
+        }
+        if (state.xhr) {
+            try { state.xhr.abort(); } catch (eAbort) {}
+            state.xhr = null;
+        }
+        try {
+            if (state.sb && state.onUpdateEnd) state.sb.removeEventListener('updateend', state.onUpdateEnd);
+        } catch (eSb) {}
+        try {
+            if (state.ms && state.ms.readyState === 'open') state.ms.abort();
+        } catch (eMs) {}
+        if (state.blobUrl) {
+            try { w.URL.revokeObjectURL(state.blobUrl); } catch (eRev) {}
+            state.blobUrl = '';
+        }
+        bridgeDebugLog('mse_stopped', {});
+    }
+
+    // Parses an HLS media playlist for MSE pumping: init segment (EXT-X-MAP),
+    // media segments with durations, live/VOD markers. Segment URIs may be
+    // relative (VOD playlists) and are resolved against the playlist URL.
+    function parseMsePlaylist(text, baseUrl) {
+        var out = {initUri: '', segs: [], endList: false, mediaSeq: 0, targetDur: 6, byterange: false};
+        if (!text || typeof text !== 'string') return out;
+        var lines = text.replace(/\r/g, '').split('\n');
+        var pendingDur = 0;
+        var i;
+        for (i = 0; i < lines.length; i++) {
+            var line = lines[i] ? lines[i].trim() : '';
+            if (!line) continue;
+            if (line.charAt(0) === '#') {
+                if (line.indexOf('#EXT-X-MAP:') === 0) {
+                    var um = line.match(/URI="([^"]+)"/);
+                    if (um && um[1]) out.initUri = toAbsoluteUrl(um[1], baseUrl);
+                } else if (line.indexOf('#EXT-X-ENDLIST') === 0) {
+                    out.endList = true;
+                } else if (line.indexOf('#EXT-X-MEDIA-SEQUENCE:') === 0) {
+                    out.mediaSeq = parseInt(line.substring(line.indexOf(':') + 1), 10) || 0;
+                } else if (line.indexOf('#EXT-X-TARGETDURATION:') === 0) {
+                    out.targetDur = parseFloat(line.substring(line.indexOf(':') + 1)) || 6;
+                } else if (line.indexOf('#EXT-X-BYTERANGE:') === 0) {
+                    out.byterange = true; // byte-range segments unsupported -> stay native
+                } else if (line.indexOf('#EXTINF:') === 0) {
+                    pendingDur = parseFloat(line.substring(8)) || 0;
+                }
+                continue;
+            }
+            if (line.indexOf(' ') !== -1) continue;
+            if (line.indexOf('http') === 0 || line.charAt(0) === '/' || /^[A-Za-z0-9_.-]/.test(line)) {
+                out.segs.push({url: toAbsoluteUrl(line, baseUrl), dur: pendingDur});
+                pendingDur = 0;
+            }
+        }
+        return out;
+    }
+
+    // Fetches playlist text (master/media/variant) through the local luna
+    // service — the only path that works: these hosts omit CORS headers for
+    // our origin, and variant hosts reject the browser's Origin with 403.
+    function fetchPlaylistText(url, timeoutMs, cb) {
+        var meta = buildNetworkRequestMeta(url, 'GET', '');
+        callUsherPlaylistService(meta, timeoutMs || MSE_PROBE_TIMEOUT_MS, function (result, reason) {
+            if (result && result.status === 200 && hasUsablePlaylistBody(result.responseText)) {
+                cb(null, result.responseText);
+            } else {
+                cb(reason || 'playlist_fetch_failed', '');
+            }
+        });
+    }
+
+    // Fetches one media segment as an ArrayBuffer. Page XHR first (live
+    // segment hosts send ACAO:*); on CORS failure retry through the same
+    // origin /sttv_proxy route (VOD cloudfront hosts send no ACAO header).
+    function fetchMseSegment(state, segUrl, cb) {
+        if (mse !== state || state.dead) return;
+        var done = false;
+        var x = null;
+        var finish = function (err, data) {
+            if (done) return;
+            done = true;
+            state.xhr = null;
+            cb(err, data);
+        };
+        var viaProxy = function () {
+            if (done) return;
+            if (mse !== state || state.dead) { finish('stale', null); return; }
+            var origin = w.location && w.location.origin ? w.location.origin : '';
+            if (!origin || origin.indexOf('http') !== 0) { finish('cors_no_proxy', null); return; }
+            var px = new XMLHttpRequest();
+            state.xhr = px;
+            try {
+                px.open('GET', origin + '/sttv_proxy?url=' + encodeURIComponent(segUrl), true);
+                px.responseType = 'arraybuffer';
+                px.onload = function () {
+                    if (px.status === 200 && px.response && px.response.byteLength) finish(null, px.response);
+                    else finish('proxy_status_' + px.status, null);
+                };
+                px.onerror = function () { finish('proxy_error', null); };
+                px.onabort = function () { finish('proxy_abort', null); };
+                px.send();
+            } catch (eProxy) {
+                finish('proxy_send', null);
+            }
+        };
+        x = new XMLHttpRequest();
+        state.xhr = x;
+        try {
+            x.open('GET', segUrl, true);
+            x.responseType = 'arraybuffer';
+            x.onload = function () {
+                if (x.status === 200 && x.response && x.response.byteLength) finish(null, x.response);
+                else viaProxy();
+            };
+            x.onerror = viaProxy;
+            x.onabort = function () { finish('abort', null); };
+            x.send();
+        } catch (eOpen) {
+            viaProxy();
+        }
+    }
+
+    // Chrome 38's MP4 parser rejects boxes it does not know — Twitch inserts
+    // `emsg` ID3 metadata boxes (spec'd in 2015) at media segment top level,
+    // and the append then fails with MEDIA_ERR_DECODE and garbage timestamps
+    // (buffered shows nonsense ranges like 62.0-62.1). Keep only the boxes
+    // this parser definitely understands; unknown ones are metadata-only and
+    // safe to drop for playback.
+    var MSE_KEEP_BOXES = {ftyp: 1, styp: 1, moov: 1, moof: 1, mdat: 1, sidx: 1, free: 1, skip: 1};
+    function readBoxHeader(view, o) {
+        var size = ((view[o] << 24) | (view[o + 1] << 16) | (view[o + 2] << 8) | view[o + 3]) >>> 0;
+        var hdr = 8;
+        if (size === 1) {
+            if (o + 16 > view.length) return null;
+            var hi = ((view[o + 8] << 24) | (view[o + 9] << 16) | (view[o + 10] << 8) | view[o + 11]) >>> 0;
+            var lo = ((view[o + 12] << 24) | (view[o + 13] << 16) | (view[o + 14] << 8) | view[o + 15]) >>> 0;
+            size = hi * 4294967296 + lo;
+            hdr = 16;
+        } else if (size === 0) {
+            size = view.length - o; // box extends to end of file
+        }
+        if (size < hdr || o + size > view.length) return null;
+        var type = String.fromCharCode(view[o + 4], view[o + 5], view[o + 6], view[o + 7]);
+        return {size: size, hdr: hdr, type: type};
+    }
+    function sanitizeMseSegment(buf) {
+        try {
+            if (!buf || !buf.byteLength || buf.byteLength < 8) return buf;
+            var view = new Uint8Array(buf);
+            var o = 0;
+            var count = 0;
+            var needCopy = false;
+            while (o + 8 <= view.length && count++ < 1024) {
+                var box = readBoxHeader(view, o);
+                if (!box) return buf; // malformed walk: hand back as-is
+                if (!MSE_KEEP_BOXES[box.type]) needCopy = true;
+                o += box.size;
+            }
+            if (!needCopy) return buf;
+            var parts = [];
+            o = 0;
+            count = 0;
+            while (o + 8 <= view.length && count++ < 1024) {
+                var b2 = readBoxHeader(view, o);
+                if (!b2) return buf;
+                if (MSE_KEEP_BOXES[b2.type]) parts.push(view.subarray(o, o + b2.size));
+                o += b2.size;
+            }
+            if (!parts.length) return buf;
+            var total = 0;
+            var pi;
+            for (pi = 0; pi < parts.length; pi++) total += parts[pi].length;
+            var out = new Uint8Array(total);
+            var off = 0;
+            for (pi = 0; pi < parts.length; pi++) {
+                out.set(parts[pi], off);
+                off += parts[pi].length;
+            }
+            bridgeDebugLog('mse_segment_sanitized', {from: buf.byteLength, to: out.byteLength});
+            return out.buffer;
+        } catch (e) {
+            return buf;
+        }
+    }
+
+    // Attaches the native HLS source to the main video (MPEG-TS channels).
+    function attachNativeMain() {
+        if (!mv) return;
+        mv.src = ms.uri;
+        applyMainLayout();
+        show(mv);
+        try { mv.load(); } catch (eLoad) {}
+    }
+
+    // Starts main playback for ms.uri. Native HLS is attached immediately (no
+    // added delay for MPEG-TS channels) while a parallel probe fetches the
+    // media playlist; if it is fMP4 we swap to the MSE pump. Generation
+    // guarded: any newer start (setMain/SetQuality) abandons stale probes.
+    function startMainPlayback() {
+        var gen = ++mainDetectGen;
+        var url = ms.uri;
+        if (!url) return;
+        stopMse(); // detach any previous MSE pipeline
+        if (ms.type === 3 || mainStreamFormat === 'ts') {
+            attachNativeMain(); // clips are direct MP4; TS is known-good here
+            return;
+        }
+        attachNativeMain();
+        var attemptProbe = function (probeUrl, isVariantProbe, retryLeft) {
+            fetchPlaylistText(probeUrl, MSE_PROBE_TIMEOUT_MS, function (err, text) {
+                if (gen !== mainDetectGen || ms.uri !== url) return; // superseded
+                if (err || !text) {
+                    bridgeDebugLog('mse_probe_fail', {error: String(err || 'empty'), retryLeft: retryLeft});
+                    if (retryLeft > 0) {
+                        w.setTimeout(function () {
+                            if (gen !== mainDetectGen || ms.uri !== url) return;
+                            attemptProbe(probeUrl, isVariantProbe, retryLeft - 1);
+                        }, 2000);
+                    }
+                    return;
+                }
+                if (!isVariantProbe && text.indexOf('#EXT-X-STREAM-INF') !== -1) {
+                    // Master playlist: resolve to the variant media playlist the
+                    // player would use and probe that instead. The segment format
+                    // is a per-stream property (transcode stack), so any variant
+                    // works, but the quality position wins when already set.
+                    var q = parseQ(text, probeUrl);
+                    var variantUrl = '';
+                    if (ms.qp >= 0 && ms.q[ms.qp] && ms.q[ms.qp].url) variantUrl = ms.q[ms.qp].url;
+                    else if (q.length) {
+                        // No quality chosen yet: default to the highest variant
+                        // at or below MSE_DEFAULT_MAX_RES. A 1080p60 fMP4
+                        // segment can be ~10MB; fetching it cold takes longer
+                        // than the app's start watchdog allows, while a low
+                        // variant starts in seconds (native ABR also ramps up
+                        // from a low variant). SetQuality upgrades later.
+                        var cap = mainMaxRes > 0 ? mainMaxRes : MSE_DEFAULT_MAX_RES;
+                        var pick = null;
+                        var qi2;
+                        for (qi2 = 0; qi2 < q.length; qi2++) {
+                            if (q[qi2].resolution > 0 && q[qi2].resolution <= cap) {
+                                pick = q[qi2];
+                                break;
+                            }
+                        }
+                        if (!pick) pick = q[q.length - 1];
+                        variantUrl = pick.url;
+                    }
+                    if (variantUrl && variantUrl !== probeUrl) {
+                        attemptProbe(variantUrl, true, 1);
+                        return;
+                    }
+                    bridgeDebugLog('mse_probe_master_unresolved', {variants: q.length});
+                    return;
+                }
+                var parsed = parseMsePlaylist(text, probeUrl);
+                if (parsed.initUri && parsed.segs.length && !parsed.byterange) {
+                    mainStreamFormat = 'fmp4';
+                    bridgeDebugLog('mse_probe_fmp4', {segs: parsed.segs.length, vod: !!parsed.endList});
+                    if (ms.uri !== probeUrl) ms.uri = probeUrl; // align quality logic with the MSE variant
+                    startMse(parsed, probeUrl, 0);
+                } else {
+                    mainStreamFormat = 'ts';
+                    bridgeDebugLog('mse_probe_ts', {segs: parsed.segs.length});
+                }
+            });
+        };
+        attemptProbe(url, false, 1);
+    }
+
+    // Boots the MSE pipeline for an already-parsed fMP4 media playlist.
+    function startMse(parsed, playlistUrl, restarts) {
+        if (!mv || !w.MediaSource || !w.URL || typeof w.URL.createObjectURL !== 'function') {
+            attachNativeMain();
+            return;
+        }
+        var codecs = '';
+        var qi;
+        for (qi = 0; qi < ms.q.length; qi++) {
+            if (ms.q[qi].url === playlistUrl) {
+                codecs = ms.q[qi].codecs;
+                break;
+            }
+        }
+        if (!codecs) codecs = 'avc1.4D401F,mp4a.40.2';
+        var mime = 'video/mp4; codecs="' + codecs + '"';
+        var supported = false;
+        try { supported = !!w.MediaSource.isTypeSupported(mime); } catch (eSup) {}
+        if (!supported) {
+            bridgeDebugLog('mse_unsupported', {mime: mime});
+            attachNativeMain();
+            return;
+        }
+        stopMse();
+        var state = {
+            playlistUrl: playlistUrl,
+            mime: mime,
+            restarts: restarts || 0,
+            ms: null,
+            sb: null,
+            onUpdateEnd: null,
+            blobUrl: '',
+            segs: parsed.segs,
+            initUri: parsed.initUri || '',
+            initPending: !!parsed.initUri,
+            targetDur: parsed.targetDur || 6,
+            durationMs: 0,
+            nextIdx: 0,
+            pending: null,
+            fetching: false,
+            xhr: null,
+            lastUrl: '',
+            appendCount: 0,
+            fetchFails: 0,
+            pollFails: 0,
+            endList: !!parsed.endList,
+            eos: false,
+            dead: false,
+            pollTimer: 0
+        };
+        if (state.endList) {
+            // VOD: full duration for the progress UI, and start pumping at the
+            // segment containing the resume offset so the loadedmetadata
+            // resume seek lands inside the buffered range.
+            var totalDur = 0;
+            var si;
+            for (si = 0; si < state.segs.length; si++) totalDur += state.segs[si].dur || parsed.targetDur;
+            state.durationMs = Math.round(totalDur * 1000);
+            if (ms.resume > 0) {
+                var targetSec = ms.resume / 1000;
+                var acc = 0;
+                var rIdx = 0;
+                for (; rIdx < state.segs.length; rIdx++) {
+                    var rd = state.segs[rIdx].dur || parsed.targetDur;
+                    if (acc + rd > targetSec) break;
+                    acc += rd;
+                }
+                state.nextIdx = Math.min(rIdx, Math.max(0, state.segs.length - 1));
+            }
+        } else {
+            // Live: start near the edge (native HLS behavior), not the oldest
+            // segment in the DVR window.
+            state.nextIdx = Math.max(0, state.segs.length - 3);
+        }
+        mse = state;
+        var media = new w.MediaSource();
+        state.ms = media;
+        state.blobUrl = w.URL.createObjectURL(media);
+        bridgeDebugLog('mse_blob_created', {
+            url: String(state.blobUrl).substring(0, 60),
+            srcBefore: String(mv.currentSrc || mv.src || '').substring(0, 50),
+            preload: mv.preload,
+            display: mv.style.display
+        });
+        media.addEventListener('sourceopen', function onSourceOpen() {
+            if (mse !== state || state.dead) return;
+            try {
+                media.removeEventListener('sourceopen', onSourceOpen);
+                state.sb = media.addSourceBuffer(state.mime);
+                state.onUpdateEnd = function () {
+                    if (mse !== state || state.dead) return;
+                    markMainProgressBaseline();
+                    msePump(state);
+                };
+                state.sb.addEventListener('updateend', state.onUpdateEnd);
+                bridgeDebugLog('mse_start', {
+                    type: ms.type,
+                    segs: state.segs.length,
+                    mime: state.mime,
+                    restarts: state.restarts,
+                    startIdx: state.nextIdx
+                });
+                mseSchedulePoll(state);
+                msePump(state);
+            } catch (eSb) {
+                bridgeDebugLog('mse_sourcebuffer_error', {error: String((eSb && eSb.message) || eSb)});
+                mseFail(state);
+            }
+        });
+        mv.src = state.blobUrl;
+        applyMainLayout();
+        show(mv);
+        try { mv.load(); } catch (eL) {}
+        tryPlay(mv);
+    }
+
+    // Schedules the next live playlist refresh (chained, never overlapping).
+    function mseSchedulePoll(state) {
+        if (state.dead || mse !== state || state.endList) return;
+        if (state.pollTimer) w.clearTimeout(state.pollTimer);
+        state.pollTimer = w.setTimeout(function () {
+            state.pollTimer = 0;
+            msePollOnce(state);
+        }, MSE_POLL_INTERVAL_MS);
+    }
+
+    // Refreshes the live playlist: extends the segment list, or restarts the
+    // pipeline when the playlist slid past everything already appended.
+    function msePollOnce(state) {
+        if (mse !== state || state.dead) return;
+        fetchPlaylistText(state.playlistUrl, MSE_PROBE_TIMEOUT_MS, function (err, text) {
+            if (mse !== state || state.dead) return;
+            if (err || !text) {
+                state.pollFails++;
+                bridgeDebugLog('mse_poll_fail', {fails: state.pollFails, error: String(err || 'empty')});
+                if (state.pollFails >= 3) {
+                    mseFail(state);
+                    return;
+                }
+                mseSchedulePoll(state);
+                return;
+            }
+            state.pollFails = 0;
+            var parsed = parseMsePlaylist(text, state.playlistUrl);
+            if (parsed.byterange) {
+                mseFail(state);
+                return;
+            }
+            if (parsed.endList) state.endList = true;
+            var newSegs = parsed.segs;
+            if (!newSegs.length) {
+                mseSchedulePoll(state);
+                return;
+            }
+            var pos = -1;
+            var k;
+            if (state.lastUrl) {
+                for (k = 0; k < newSegs.length; k++) {
+                    if (newSegs[k].url === state.lastUrl) {
+                        pos = k;
+                        break;
+                    }
+                }
+            }
+            if (state.appendCount > 0 && state.lastUrl && pos === -1) {
+                bridgeDebugLog('mse_playlist_jump', {mediaSeq: parsed.mediaSeq, segs: newSegs.length});
+                if (state.restarts >= 3) {
+                    mseFail(state);
+                    return;
+                }
+                var restarts = state.restarts + 1;
+                var url = state.playlistUrl;
+                stopMse();
+                startMse(parsed, url, restarts);
+                return;
+            }
+            state.segs = newSegs;
+            if (pos >= 0) state.nextIdx = pos + 1;
+            else if (state.appendCount === 0) state.nextIdx = Math.min(state.nextIdx, newSegs.length);
+            msePump(state);
+            mseSchedulePoll(state);
+        });
+    }
+
+    // Appends the next segment when the buffer needs data. Driven by
+    // updateend, timeupdate, seeks and the live playlist poll.
+    function msePump(state) {
+        if (!state || state.dead || mse !== state) return;
+        var sb = state.sb;
+        if (!sb || sb.updating || state.fetching) return;
+        var ct = 0;
+        try {
+            if (mv && !isNaN(mv.currentTime) && isFinite(mv.currentTime)) ct = mv.currentTime;
+        } catch (eCt) {}
+        var bStart = -1;
+        var bEnd = -1;
+        try {
+            if (sb.buffered.length) {
+                bStart = sb.buffered.start(0);
+                bEnd = sb.buffered.end(sb.buffered.length - 1);
+            }
+        } catch (eBuf) {}
+        if (state.pending) {
+            var buf = state.pending;
+            state.pending = null;
+            try {
+                sb.appendBuffer(buf);
+                state.appendCount++;
+                state.fetchFails = 0;
+                markMainProgressBaseline();
+            } catch (eAppend) {
+                if (eAppend && eAppend.name === 'QuotaExceededError' && bStart >= 0) {
+                    var keepFrom = Math.max(0, ct - MSE_BUFFER_KEEP_SECONDS);
+                    if (keepFrom > bStart + 2) {
+                        state.pending = buf;
+                        try {
+                            sb.remove(bStart, keepFrom);
+                            return; // updateend re-enters and retries the append
+                        } catch (eRemove) {
+                            state.pending = null;
+                        }
+                    }
+                }
+                bridgeDebugLog('mse_append_error', {name: String((eAppend && eAppend.name) || eAppend)});
+                state.fetchFails++;
+                if (state.fetchFails >= MSE_SEGMENT_MAX_FAILS) {
+                    mseHandleHardFailure(state);
+                    return;
+                }
+                msePump(state);
+                return;
+            }
+            return;
+        }
+        var needMore = state.nextIdx < state.segs.length && (bEnd <= 0 || bEnd - ct < MSE_BUFFER_TARGET_SECONDS);
+        if (!needMore) {
+            if (state.endList && !state.eos && state.nextIdx >= state.segs.length && bEnd > 0 && bEnd - ct < 5) {
+                state.eos = true;
+                try {
+                    state.ms.endOfStream();
+                    bridgeDebugLog('mse_end_of_stream', {});
+                } catch (eEos) {}
+            }
+            return;
+        }
+        var fetchIdx = state.nextIdx;
+        var segUrl = '';
+        var seg = null;
+        if (state.initPending) {
+            // The init segment (EXT-X-MAP) must be appended before any media.
+            segUrl = state.initUri;
+        } else {
+            seg = state.segs[fetchIdx];
+            if (!seg) return;
+            segUrl = seg.url;
+        }
+        state.fetching = true;
+        fetchMseSegment(state, segUrl, function (err, data) {
+            state.fetching = false;
+            if (mse !== state || state.dead) return;
+            if (!state.initPending && state.nextIdx !== fetchIdx) return; // a seek or poll moved the cursor
+            if (err || !data) {
+                state.fetchFails++;
+                bridgeDebugLog('mse_segment_fail', {idx: fetchIdx, init: state.initPending, fails: state.fetchFails, error: String(err || 'empty')});
+                if (state.fetchFails >= MSE_SEGMENT_MAX_FAILS) {
+                    mseHandleHardFailure(state);
+                    return;
+                }
+                w.setTimeout(function () { msePump(state); }, 300 * state.fetchFails);
+                return;
+            }
+            state.fetchFails = 0;
+            if (state.initPending) {
+                state.initPending = false;
+                state.pending = sanitizeMseSegment(data);
+                msePump(state);
+                return;
+            }
+            state.lastUrl = seg.url;
+            state.nextIdx = fetchIdx + 1;
+            state.pending = sanitizeMseSegment(data);
+            msePump(state);
+        });
+    }
+
+    // Hard failure (segment fetches/appends exhausted): restart the pipeline
+    // up to 3 times, then escalate to the upstream failure handler.
+    function mseHandleHardFailure(state) {
+        if (mse !== state) return;
+        if ((state.restarts || 0) < 3) {
+            var restarts = (state.restarts || 0) + 1;
+            var url = state.playlistUrl;
+            bridgeDebugLog('mse_restart', {restarts: restarts, reason: 'hard_failure'});
+            restartMseForUrl(url, restarts);
+            return;
+        }
+        mseFail(state);
+    }
+
+    // Re-fetches the media playlist and boots a fresh pipeline (used after
+    // hard failures and playlist jumps).
+    function restartMseForUrl(playlistUrl, restarts) {
+        var gen = mainDetectGen;
+        stopMse();
+        fetchPlaylistText(playlistUrl, MSE_PROBE_TIMEOUT_MS, function (err, text) {
+            if (gen !== mainDetectGen) return; // a newer stream started meanwhile
+            if (err || !text) {
+                bridgeDebugLog('mse_restart_fetch_fail', {error: String(err || 'empty')});
+                handleMainPlaybackFailure(1, 0);
+                return;
+            }
+            var parsed = parseMsePlaylist(text, playlistUrl);
+            if (!parsed.initUri || !parsed.segs.length) {
+                mainStreamFormat = 'ts';
+                attachNativeMain();
+                return;
+            }
+            startMse(parsed, playlistUrl, restarts);
+        });
+    }
+
+    // Keeps the pump aligned after seeks: VOD jumps move the segment cursor;
+    // live seeks behind the buffered start are clamped forward.
+    function mseHandleSeek(state) {
+        if (!state || state.dead || mse !== state || !state.sb) return;
+        var ct = 0;
+        try { ct = mv.currentTime; } catch (eCt) {}
+        var bStart = -1;
+        var bEnd = -1;
+        try {
+            if (state.sb.buffered.length) {
+                bStart = state.sb.buffered.start(0);
+                bEnd = state.sb.buffered.end(state.sb.buffered.length - 1);
+            }
+        } catch (eBuf) {}
+        if (state.endList) {
+            if (bEnd >= 0 && ct > bEnd + 1) {
+                var idx = mseIndexForTime(state, ct);
+                if (idx >= state.nextIdx) {
+                    state.nextIdx = idx;
+                    state.pending = null;
+                }
+            } else if (bStart >= 0 && ct < bStart - 0.5) {
+                var idxBack = mseIndexForTime(state, ct);
+                if (idxBack >= 0 && idxBack < state.nextIdx) {
+                    state.nextIdx = idxBack;
+                    state.pending = null;
+                }
+            }
+        } else if (bStart >= 0 && ct < bStart) {
+            try { mv.currentTime = bStart + 0.5; } catch (eSeek) {}
+        }
+        msePump(state);
+    }
+
+    // Segment index whose cumulative duration contains time t (VOD timelines
+    // start at 0; falls back to the playlist target duration).
+    function mseIndexForTime(state, t) {
+        var acc = 0;
+        var i;
+        for (i = 0; i < state.segs.length; i++) {
+            var d = state.segs[i].dur || state.targetDur;
+            if (acc + d > t) return i;
+            acc += d;
+        }
+        return state.segs.length - 1;
+    }
+
+    // Escalates an unrecoverable MSE failure to the upstream failure handler.
+    function mseFail(state) {
+        if (mse !== state) return;
+        bridgeDebugLog('mse_failed', {restarts: state.restarts || 0});
+        stopMse();
+        handleMainPlaybackFailure(1, 0);
+    }
+
     // =========================================================================
     // Network Layer
     // =========================================================================
@@ -2551,6 +3431,17 @@
         if (!isUsherPlaylistPath(meta.pathLower || '')) return false;
         return String(meta.method || 'GET').toUpperCase() === 'GET';
     }
+    // Chrome 38 / webOS 3.4 can only decode H.264 (canPlayType av01 = "" and
+    // HEVC variants are unreliable in native HLS). The upstream app requests
+    // supported_codecs=av1,h265,h264 based on the synthetic getcodecCapabilities
+    // payload, and native ABR may then select an AV1/HEVC variant that never
+    // decodes (black video with a growing buffer). Force h264-only on usher
+    // playlist URLs so Twitch only advertises variants this browser can play.
+    function limitUsherCodecs(rawUrl) {
+        if (typeof rawUrl !== 'string' || rawUrl.indexOf('usher.ttvnw.net') === -1) return rawUrl;
+        if (rawUrl.indexOf('supported_codecs=') === -1) return rawUrl;
+        return rawUrl.replace(/([?&]supported_codecs=)[^&]*/, '$1h264');
+    }
     function shouldUseUsherPlaylistCorsFallback(meta, status, text, reason) {
         if (!isUsherPlaylistRequest(meta)) return false;
         var st = parseInt(status, 10) || 0;
@@ -2669,6 +3560,7 @@
             }
             if (bridge) {
                 try { bridge.onservicecallback = null; } catch (eCb) {}
+                try { bridge.onserviceerror = null; } catch (eCbErr) {}
                 try { bridge.cancel(); } catch (eCancel) {}
             }
             bridge = null;
@@ -2681,6 +3573,7 @@
             return;
         }
         bridge.onservicecallback = function (msg) {
+            usherServiceWarm = true;
             var parsed = safeParse(msg, null);
             var normalized = normalizeServicePlaylistResult(parsed, meta);
             if (normalized) {
@@ -2694,9 +3587,14 @@
             }
             safeFinish(null, reason);
         };
+        bridge.onserviceerror = function (err) {
+            // Any bus reply (even an error) proves the service process is up.
+            usherServiceWarm = true;
+            safeFinish(null, 'service_bus_error_' + String((err && err.errorCode) || 'unknown').toLowerCase());
+        };
         timerId = w.setTimeout(function () {
             safeFinish(null, 'service_timeout');
-        }, getUsherPlaylistServiceTimeoutMs(timeoutMs) + 150);
+        }, getUsherPlaylistServiceTimeoutMs(timeoutMs) + (usherServiceWarm ? USHER_PLAYLIST_SERVICE_WARM_MARGIN_MS : USHER_PLAYLIST_SERVICE_COLD_GRACE_MS));
         try {
             bridge.call('luna://' + serviceName + '/fetchPlaylist', JSON.stringify({
                 url: requestUrl,
@@ -2709,6 +3607,44 @@
         } catch (eCall) {
             safeFinish(null, 'service_call_exception');
         }
+    }
+    // Spawns the local HLS service process at startup. The first service call
+    // after boot otherwise pays the node cold-start inside the playback
+    // watchdog, which used to surface as a synthetic empty playlist (black
+    // screen). The invalid URL is rejected by the service before any network
+    // I/O, so this is cheap — it only forces ls2 to launch the process.
+    function warmUsherPlaylistService() {
+        try {
+            if (usherServiceWarm) return;
+            if (typeof w.PalmServiceBridge !== 'function') return;
+            var serviceName = getUsherPlaylistServiceName();
+            if (!serviceName) return;
+            var warmBridge = new w.PalmServiceBridge();
+            var warmSettled = false;
+            var warmFinish = function () {
+                if (warmSettled) return;
+                warmSettled = true;
+                try { warmBridge.onservicecallback = null; } catch (eCb) {}
+                try { warmBridge.onserviceerror = null; } catch (eCbErr) {}
+                try { warmBridge.cancel(); } catch (eCancel) {}
+                warmBridge = null;
+            };
+            warmBridge.onservicecallback = function () {
+                usherServiceWarm = true;
+                warmFinish();
+            };
+            warmBridge.onserviceerror = function () {
+                usherServiceWarm = true;
+                warmFinish();
+            };
+            warmBridge.call(
+                'luna://' + serviceName + '/fetchPlaylist',
+                // Real usher host (rejected quickly upstream without a token):
+                // spawns the node process AND warms DNS/TLS to usher.ttvnw.net.
+                JSON.stringify({url: 'https://usher.ttvnw.net/vod/1.m3u8', timeoutMs: 4000})
+            );
+            w.setTimeout(warmFinish, 15000);
+        } catch (eWarm) {}
     }
     function flushUsherPlaylistInFlight(requestKey, result, reason) {
         var inFlight = usherPlaylistInFlightByKey[requestKey];
@@ -3066,6 +4002,7 @@
     // Android: Android.XmlHttpGetFull() / Android.BasexmlHttpGet() via OkHttp.
     // webOS:   XHR with timeout, circuit-breaker, dedupe, and response caching.
     function sendAsyncRequest(u, to, pm, m, h, cb) {
+        u = limitUsherCodecs(u);
         var req = resolveRequestMethodAndBody(pm, m);
         var method = req.method;
         var body = req.body;
@@ -3078,8 +4015,41 @@
         var x;
         var done = false;
         var serviceAttempted = false;
+        var serviceRetried = false;
+        // Attempts the local HLS service, retrying once on failure (the first
+        // attempt after boot may only get as far as spawning the node process).
+        var attemptUsherService = function (failReason) {
+            requestUsherPlaylistViaService(meta, effectiveTimeout, function (serviceResult, serviceReason) {
+                if (serviceResult && serviceResult.status === 200 && hasUsablePlaylistBody(serviceResult.responseText)) {
+                    finish(serviceResult.status, serviceResult.responseText, 'service_success', serviceResult.url || meta.url || '', true, true);
+                    return;
+                }
+                var reasonText = String(serviceReason || failReason || '');
+                if (!serviceRetried && (reasonText.indexOf('timeout') !== -1 || reasonText.indexOf('unavailable') !== -1)) {
+                    serviceRetried = true;
+                    // Attempt 1 already paid the node spawn budget; mark warm so
+                    // the retry uses the normal (short) watchdog instead of
+                    // doubling the worst-case wait.
+                    usherServiceWarm = true;
+                    bridgeDebugLog('usher_hls_service_retry', {
+                        reason: reasonText,
+                        url: meta && meta.url ? meta.url : ''
+                    });
+                    attemptUsherService(reasonText);
+                    return;
+                }
+                var fallback = buildUsherPlaylistCorsFallbackResult(meta, 0, reasonText || 'service_unavailable');
+                finish(fallback.status, fallback.responseText, 'cors_fallback_synthetic', fallback.url, true, true);
+            });
+        };
         var finish = function (status, text, reason, responseUrl, synthetic, skipServiceAttempt) {
             if (done) return;
+            // The XHR fires several terminal events (readystatechange, error,
+            // abort) for one failure. Once the service fallback is in flight,
+            // only its synthetic result may complete this request — otherwise a
+            // stale status-0 event reaches the app first, the app treats it as
+            // a playback failure and shuts down before the playlist arrives.
+            if (serviceAttempted && !synthetic) return;
             if (!skipServiceAttempt && !serviceAttempted && shouldUseUsherPlaylistCorsFallback(meta, status, text, reason)) {
                 serviceAttempted = true;
                 usherPlaylistCorsFailureSeen = true;
@@ -3087,14 +4057,7 @@
                     reason: reason || 'unknown',
                     url: meta && meta.url ? meta.url : ''
                 });
-                requestUsherPlaylistViaService(meta, effectiveTimeout, function (serviceResult, serviceReason) {
-                    if (serviceResult && serviceResult.status === 200 && hasUsablePlaylistBody(serviceResult.responseText)) {
-                        finish(serviceResult.status, serviceResult.responseText, 'service_success', serviceResult.url || meta.url || '', true, true);
-                        return;
-                    }
-                    var fallback = buildUsherPlaylistCorsFallbackResult(meta, 0, serviceReason || reason || 'service_unavailable');
-                    finish(fallback.status, fallback.responseText, 'cors_fallback_synthetic', fallback.url, true, true);
-                });
+                attemptUsherService(reason);
                 return;
             }
             done = true;
@@ -3131,14 +4094,8 @@
                     url: meta && meta.url ? meta.url : ''
                 });
             }
-            requestUsherPlaylistViaService(meta, effectiveTimeout, function (serviceResult, serviceReason) {
-                if (serviceResult && serviceResult.status === 200 && hasUsablePlaylistBody(serviceResult.responseText)) {
-                    finish(serviceResult.status, serviceResult.responseText, 'service_success', serviceResult.url || meta.url || '', true, true);
-                    return;
-                }
-                var fallback = buildUsherPlaylistCorsFallbackResult(meta, 0, serviceReason || 'service_unavailable');
-                finish(fallback.status, fallback.responseText, 'service_fail_synthetic', fallback.url, true, true);
-            });
+            serviceAttempted = true;
+            attemptUsherService('service_fail');
             return;
         }
         if (meta.circuitEnabled && isCircuitOpenForHost(meta.host)) {
@@ -3168,6 +4125,7 @@
     // Core XHR function. Supports both sync (mMethodUrlHeaders) and async modes.
     // Sync mode blocks the main thread — see network layer comment above for rationale.
     function xhrReq(u, to, pm, m, ck, h, sync) {
+        u = limitUsherCodecs(u);
         var req = resolveRequestMethodAndBody(pm, m);
         var method = req.method;
         var body = req.body;
@@ -4122,13 +5080,20 @@
         // IMPLEMENTED: Async HTTP request (basic). Android: OkHttp async call.
         A.BasexmlHttpGet = function (u, to, pm, m, h, cb, ck, key, ok, err) { sendAsyncRequest(u, to, pm, m, h, function (status, text) { call(cb, [res(status, text, ck), key, ok, err, ck]); }); };
         // IMPLEMENTED: Async HTTP request (full, with extended check parameters). Android: OkHttp async.
-        A.XmlHttpGetFull = function (u, to, pm, m, h, cb, ck, c1, c2, c3, c4, c5, ok, err) { sendAsyncRequest(u, to, pm, m, h, function (status, text, responseUrl) { call(cb, [res(status, text, ck, responseUrl), ck, c1, c2, c3, c4, c5, ok, err]); }); };
+        A.XmlHttpGetFull = function (u, to, pm, m, h, cb, ck, c1, c2, c3, c4, c5, ok, err) {
+            bridgeDebugLog('xmlhttpfull_request', {cb: cb || '', ck: ck || 0, url: String(u || '').substring(0, 120)});
+            sendAsyncRequest(u, to, pm, m, h, function (status, text, responseUrl) {
+                bridgeDebugLog('xmlhttpfull_response', {cb: cb || '', ck: ck || 0, status: status || 0, len: (text || '').length});
+                call(cb, [res(status, text, ck, responseUrl), ck, c1, c2, c3, c4, c5, ok, err]);
+            });
+        };
 
         // --- Playback Start / Control ---
 
         // IMPLEMENTED: Start playback on main (player=0) or secondary (player>0) player.
         // Android: ExoPlayer.prepare() on primary or secondary instance.
         A.StartAuto = function (u, pl, t, rs, player) {
+            bridgeDebugLog('start_auto', {type: t || 0, player: player || 0, hasPlaylist: !!(pl && pl.length), url: String(u || '').substring(0, 120)});
             if (player && player > 0) {
                 if (!setPrev(u, pl, t, rs, 'extra', player, player)) return;
             } else setMain(u, pl, t, rs);
@@ -4212,7 +5177,18 @@
                 hasTarget: !!tg,
                 sameTarget: sameTarget
             });
-            if (!tg || sameTarget) return;
+            if (!tg) return;
+            if (mseActive() || mainStreamFormat === 'fmp4') {
+                // MSE mode: the blob src never equals a playlist URL, so the
+                // target check compares against ms.uri (the active MSE variant).
+                if (tg === ms.uri) return;
+                ms.resume = ms.type === 2 ? mtime() : 0;
+                ms.uri = tg;
+                startMainPlayback(); // fetch the new playlist, restart MSE or native
+                bridgeDebugLog('set_quality_applied', {pos: ms.qp, available: ms.q.length, mse: true});
+                return;
+            }
+            if (sameTarget) return;
             ms.resume = ms.type === 2 || ms.type === 3 ? mtime() : 0;
             ms.uri = tg;
             mv.src = tg;
@@ -4657,7 +5633,26 @@
         // IMPLEMENTED: Returns User-Agent string as webview version surrogate.
         A.getWebviewVersion = function () { return ua || ''; };
         // IMPLEMENTED: Returns synthetic codec capability payload for upstream codec/settings UI.
-        A.getcodecCapabilities = function (ct) { var mime = ct === 'hevc' ? 'video/hevc' : ct === 'av01' ? 'video/av01' : 'video/avc'; var n = 'webos.' + (ct || 'avc') + '.decoder'; return JSON.stringify([{CanonicalName: n, instances: 2, isHardwareAccelerated: true, isSoftwareOnly: false, name: n, nameType: n + mime, type: mime, supportsIsHw: true, resolutions: 'Unknown', maxresolution: 'Unknown', maxbitrate: 'Unknown', maxlevel: 'Unknown'}]); };
+        // Probes canPlayType so the app only requests codecs this browser can
+        // actually decode (Chrome 38/webOS 3.4 has no AV1; claiming it made the
+        // app request supported_codecs=av1 and native ABR could pick a variant
+        // that never decodes).
+        A.getcodecCapabilities = function (ct) {
+            var type = ct === 'hevc' ? 'hevc' : ct === 'av01' ? 'av01' : 'avc';
+            var mime = type === 'hevc' ? 'video/hevc' : type === 'av01' ? 'video/av01' : 'video/avc';
+            var probe = type === 'hevc' ? 'video/mp4; codecs="hvc1.1.6.L93.B0"' : type === 'av01' ? 'video/mp4; codecs="av01.0.04M.08"' : 'video/mp4; codecs="avc1.64002A"';
+            var supported = type === 'avc';
+            try {
+                if (!supported && w.document && w.document.createElement) {
+                    supported = !!w.document.createElement('video').canPlayType(probe);
+                }
+            } catch (eProbe) {
+                supported = type === 'avc';
+            }
+            if (!supported) return '[]';
+            var n = 'webos.' + type + '.decoder';
+            return JSON.stringify([{CanonicalName: n, instances: 2, isHardwareAccelerated: true, isSoftwareOnly: false, name: n, nameType: n + mime, type: mime, supportsIsHw: true, resolutions: 'Unknown', maxresolution: 'Unknown', maxbitrate: 'Unknown', maxlevel: 'Unknown'}]);
+        };
         // NO-OP: Android reads accessibility service state; webOS bridge does not expose that signal.
         A.isAccessibilitySettingsOn = function () { return false; };
         // IMPLEMENTED (compat): Notification permission considered granted to avoid upstream gating.
@@ -4848,4 +5843,7 @@
     versionRefreshIntervalId = w.setInterval(checkForkVersionAndRefresh, VERSION_REFRESH_MIN_INTERVAL_MS);
     // 12) Restore app token from persisted storage (legacy key fallback included).
     try { appToken = w.localStorage ? (w.localStorage.getItem(STORAGE_PREFIX + 'app_token') || w.localStorage.getItem('sttv_webos_app_token')) : null; } catch (e) { appToken = null; }
+    // 13) Pre-spawn the local HLS service so the first live/VOD playlist fetch
+    // does not include the node cold-start inside its playback watchdog.
+    w.setTimeout(warmUsherPlaylistService, 1000);
 })(window);

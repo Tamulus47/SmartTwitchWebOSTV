@@ -16,6 +16,7 @@
   "devDependencies": {
     "@webos-tools/cli": "^3.2.1",
     "crass": "^0.12.3",
+    "esprima": "^4.0.1",
     "firebase": "^12.8.0",
     "html-minifier": "^4.0.0",
     "jshint": "^2.13.6",
@@ -24,4 +25,3 @@
     "uglify-js": "^3.19.3"
   }
 }
-

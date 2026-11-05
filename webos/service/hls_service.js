@@ -13,7 +13,6 @@ var urlLib = require('url');
 
 var service = new Service(pkgInfo.name);
 
-var ALLOWED_HOST = 'usher.ttvnw.net';
 var MAX_RESPONSE_BYTES = 1024 * 1024;
 var DEFAULT_TIMEOUT_MS = 4500;
 var MIN_TIMEOUT_MS = 1200;
@@ -31,12 +30,17 @@ function clampTimeout(value) {
 function isAllowedPlaylistUrl(parsedUrl) {
     if (!parsedUrl) return false;
     if (parsedUrl.protocol !== 'https:') return false;
-    if (String(parsedUrl.hostname || '').toLowerCase() !== ALLOWED_HOST) return false;
+    var hostname = String(parsedUrl.hostname || '').toLowerCase();
     var path = String(parsedUrl.pathname || '').toLowerCase();
-    if (!/\.m3u8$/.test(path)) return false;
-    if (path.indexOf('/api/channel/hls/') === 0) return true;
-    if (path.indexOf('/vod/') === 0) return true;
-    return false;
+    // Variant media playlists (playlist.ttvnw.net, no .m3u8 extension).
+    // Needed so the bridge can detect fMP4 channels (EXT-X-MAP) and drive
+    // MSE playback; Chrome's native HLS cannot decode fMP4 segments.
+    if (/\.playlist\.ttvnw\.net$/.test(hostname)) {
+        return path.indexOf('/v1/playlist/') === 0;
+    }
+    // Master playlists (usher.ttvnw.net) and media playlists (cloudfront VOD
+    // hosts such as d1m7jfoe9zdc1j.cloudfront.net/.../index-dvr.m3u8).
+    return /\.m3u8$/.test(path);
 }
 
 function respondError(message, statusCode, errorCode, errorText) {
@@ -97,9 +101,14 @@ service.register('fetchPlaylist', function (message) {
         'Accept-Encoding': 'identity',
         'Accept-Language': requestAcceptLanguage
     };
-    if (requestOrigin) requestHeaders.Origin = requestOrigin;
-    if (requestReferer) requestHeaders.Referer = requestReferer;
-    if (requestUserAgent) requestHeaders['User-Agent'] = requestUserAgent;
+    // playlist.ttvnw.net (variant playlists) rejects unknown Origin headers
+    // with 403; only forward browser identity headers to usher.
+    var isVariantHost = /\.playlist\.ttvnw\.net$/.test(String(parsedUrl.hostname || '').toLowerCase());
+    if (!isVariantHost) {
+        if (requestOrigin) requestHeaders.Origin = requestOrigin;
+        if (requestReferer) requestHeaders.Referer = requestReferer;
+        if (requestUserAgent) requestHeaders['User-Agent'] = requestUserAgent;
+    }
     requestHeaders['Sec-Fetch-Mode'] = 'cors';
     requestHeaders['Sec-Fetch-Site'] = 'cross-site';
 
