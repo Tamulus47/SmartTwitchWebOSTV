@@ -166,9 +166,16 @@ local remux server runs **only while the app is open**.
    - **`sttv_boot_kick` present** (boot activity): kick
      `org.webosbrew.hbchannel.service/autostart` (runs
      `/var/lib/webosbrew/startup.sh` as root: dropbear + telnetd +
-     `run-parts /var/lib/webosbrew/init.d`), then `applicationManager/close`
-     itself (sent twice,800ms apart). No navigation, no server, no SmartTwitch
-     left running — the wrapper window exists only for the moments of the kick.
+     `run-parts /var/lib/webosbrew/init.d`). The kick is retried on service
+     error (2.5/5/7.5s, up to 4 attempts) because at `core-boot-done` the
+     Homebrew service may not be registered yet - a single fire-and-forget
+     kick was observed to be lost (boot with no dropbear). The window closes
+     itself as soon as the kick is acknowledged (12s absolute cap) via
+     `applicationManager/close` (sent twice) plus a `window.close()` fallback
+     (the only close mechanism this TV accepts; the luna `close` method
+     rejects `{id}`/`appId` here). No navigation, no server, no SmartTwitch
+     left running - the wrapper window exists only for the moments of the
+     kick.
    - **normal manual launch**: kick + `ensureSttvServe()` + install the launch
      handlers that navigate to the hosted app.
 3. **sttv_serve lifecycle — starts with the app, stops when it closes**
@@ -185,6 +192,12 @@ local remux server runs **only while the app is open**.
    - *self-heal*: a failed heartbeat re-ensures the server (it may have
      self-stopped while the page was suspended), and becoming visible again
      re-ensures it too; active playback requests also keep it alive.
+
+Verified end-to-end on the TV (2026-11-06): boot with no manual action ->
+`/tmp/webosbrew_startup` written ~30s in, ports 22+23 up, port 8099 down,
+`init.d` empty, `/json` shows no SmartTwitch target (wrapper self-closed);
+manual open -> server up; app close -> server stopped ~70s later via the
+heartbeat (unload hooks did not fire on this close).
 
 Homebrew Channel was upgraded 0.6.3 -> 0.7.3 on this TV (backup:
 `/media/developer/hb_backup_063.tgz`); its service registers the same boot
