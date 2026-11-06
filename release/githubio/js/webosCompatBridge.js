@@ -3093,16 +3093,27 @@
             return;
         }
         attachNativeMain();
+        // Slow-retry budget: when the format probe fails entirely (luna service
+        // cold start, WiFi blip), keep re-probing every few seconds instead of
+        // giving up - otherwise fMP4 streams stay attached as raw URLs and spin
+        // on "loading" forever (typical after a session restore).
+        var probeSlowLeft = 8;
         var attemptProbe = function (probeUrl, isVariantProbe, retryLeft) {
             fetchPlaylistText(probeUrl, MSE_PROBE_TIMEOUT_MS, function (err, text) {
                 if (gen !== mainDetectGen || ms.uri !== url) return; // superseded
                 if (err || !text) {
-                    bridgeDebugLog('mse_probe_fail', {error: String(err || 'empty'), retryLeft: retryLeft});
+                    bridgeDebugLog('mse_probe_fail', {error: String(err || 'empty'), retryLeft: retryLeft, slowLeft: probeSlowLeft});
                     if (retryLeft > 0) {
                         w.setTimeout(function () {
                             if (gen !== mainDetectGen || ms.uri !== url) return;
                             attemptProbe(probeUrl, isVariantProbe, retryLeft - 1);
                         }, 2000);
+                    } else if (probeSlowLeft > 0) {
+                        probeSlowLeft--;
+                        w.setTimeout(function () {
+                            if (gen !== mainDetectGen || ms.uri !== url) return;
+                            attemptProbe(probeUrl, isVariantProbe, 1);
+                        }, 8000);
                     }
                     return;
                 }
@@ -5478,21 +5489,34 @@
                 // target check compares against ms.uri (the active MSE variant).
                 if (tg === ms.uri) return;
                 ms.resume = ms.type === 2 ? mtime() : 0;
+                if (!isFinite(ms.resume)) ms.resume = 0;
                 ms.uri = tg;
                 startMainPlayback(); // fetch the new playlist, restart MSE or native
                 bridgeDebugLog('set_quality_applied', {pos: ms.qp, available: ms.q.length, mse: true});
                 return;
             }
-            if (sameTarget) return;
+            if (mainStreamFormat === 'ts') {
+                // Known MPEG-TS: direct native swap (the platform player handles
+                // it, no probe needed).
+                if (sameTarget) return;
+                ms.resume = ms.type === 2 || ms.type === 3 ? mtime() : 0;
+                if (!isFinite(ms.resume)) ms.resume = 0;
+                ms.uri = tg;
+                mv.src = tg;
+                try { mv.load(); } catch (e) {}
+                tryPlay(mv);
+                bridgeDebugLog('set_quality_applied', {pos: ms.qp, available: ms.q.length, flow: 'native-ts'});
+                return;
+            }
+            // Stream format unknown (e.g., after a session restore whose probe
+            // failed): NEVER attach a raw URL directly - fMP4 would stall
+            // forever on webOS 3.4. Run the full probe flow so fMP4 content is
+            // routed to the local TS remux (or detected as TS and kept native).
             ms.resume = ms.type === 2 || ms.type === 3 ? mtime() : 0;
+            if (!isFinite(ms.resume)) ms.resume = 0;
             ms.uri = tg;
-            mv.src = tg;
-            try { mv.load(); } catch (e) {}
-            tryPlay(mv);
-            bridgeDebugLog('set_quality_applied', {
-                pos: ms.qp,
-                available: ms.q.length
-            });
+            startMainPlayback();
+            bridgeDebugLog('set_quality_applied', {pos: ms.qp, available: ms.q.length, flow: 'full-probe'});
         };
         // IMPLEMENTED: Returns available quality options as JSON array.
         A.getQualities = function () {
