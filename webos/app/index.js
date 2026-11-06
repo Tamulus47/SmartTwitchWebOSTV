@@ -174,4 +174,29 @@
     }
 
     installLaunchHandlers();
+
+    // Kick the Homebrew Channel startup script on every wrapper launch. The
+    // boot-time launch is armed as a persistent webOS activity (callback =
+    // applicationManager/launch of this app), and startup.sh runs as root:
+    // it starts sshd (dropbear) and executes /var/lib/webosbrew/init.d hooks
+    // (the local fMP4->TS remux server). Fire-and-forget; the service call is
+    // delivered immediately and startup.sh is idempotent per boot (marker in
+    // /tmp), so repeated launches are no-ops. On non-rooted TVs PalmServiceBridge
+    // or the service is missing and this silently does nothing.
+    var homebrewKickBridge = null;
+    function kickHomebrewStartup() {
+        try {
+            if (typeof global.PalmServiceBridge !== 'function') return;
+            homebrewKickBridge = new global.PalmServiceBridge();
+            homebrewKickBridge.onservicecallback = function () {};
+            homebrewKickBridge.call(
+                'luna://org.webosbrew.hbchannel.service/autostart',
+                '{"reason":"sttv-wrapper"}'
+            );
+            debugLog('homebrew_kick_sent', {});
+        } catch (e) {
+            debugLog('homebrew_kick_error', {error: String(e)});
+        }
+    }
+    kickHomebrewStartup();
 })(window);
