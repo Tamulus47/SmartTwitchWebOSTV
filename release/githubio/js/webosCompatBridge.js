@@ -3034,6 +3034,18 @@
     // remux playlist so ms.rawUri/ms.uri keep pointing at the real stream).
     function attachNativeMainTo(uri) {
         if (!mv) return;
+        // CORS-mode fetch for the local remux server only: tv-serve sends
+        // ACAO * on every response, and crossorigin=anonymous is what makes
+        // canvas readback (drawImage + toDataURL) of frames possible -
+        // response headers alone do not untaint in no-cors mode. Direct
+        // Twitch URLs stay no-cors (they may lack CORS headers).
+        try {
+            if (uri && uri.indexOf(REMUX_BASE) === 0) {
+                mv.crossOrigin = 'anonymous';
+            } else if (mv.crossOrigin) {
+                mv.crossOrigin = '';
+            }
+        } catch (eCo) {}
         mv.src = uri;
         applyMainLayout();
         show(mv);
