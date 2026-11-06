@@ -701,9 +701,18 @@ function annexb(vinfo, buf, sample) {
         }
     }
     for (i = 0; i < nals.length; i++) {
+        // Twitch's fMP4 carries END-OF-SEQUENCE(10) / END-OF-STREAM(11) NALs
+        // at ad-break and serving-switch boundaries. Copying them into the TS
+        // makes the platform decoder obey them and stop decoding right there:
+        // observed as an audio+video freeze every ~5min (mid-roll ad cadence)
+        // while the loader keeps downloading; VODs never hit it (single
+        // continuous encode, no EOS markers). Drop them so playback continues
+        // into the next segment.
+        if (nals[i].type === 10 || nals[i].type === 11) continue;
         parts.push(SO4);
         parts.push(buf.slice(nals[i].off, nals[i].off + nals[i].len));
     }
+    if (!parts.length) return null;
     return Buffer.concat(parts);
 }
 
