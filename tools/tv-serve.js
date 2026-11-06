@@ -731,7 +731,29 @@ function adtsFrame(ainfo, buf, sample) {
     return Buffer.concat([h, buf.slice(sample.off, sample.off + payloadLen)]);
 }
 
-function muxSegment(info, segBuf, stats) {
+// PTS rebase for streams whose raw timestamps exceed2^30: the platform's
+// (2016-era) media stack is believed to do signed-int32 PTS math - when
+// Pisty's live stream lifetime crossed2^31 ticks (23:18 UTC Nov6) every
+// downstream timestamp inverted and live wedged permanently (VODs stay far
+// under the limit forever -> they work). Per-stream constant offset keeps
+// emitted PTS near0 (26.5h of headroom), preserves inter-segment continuity
+// (audio+video share the offset), and never applies to low-timestamp VODs.
+var ptsOffset = {};
+var ptsOffsetOrder = [];
+function getOffset90k(u, raw90) {
+    if (!u) return 0;
+    var o = ptsOffset[u];
+    if (o !== undefined) return o;
+    if (raw90 < 1073741824) return 0; // below2^30: already platform-safe
+    o = raw90;
+    ptsOffset[u] = o;
+    ptsOffsetOrder.push(u);
+    while (ptsOffsetOrder.length > 8) delete ptsOffset[ptsOffsetOrder.shift()];
+    logLine('pts rebase offset=' + o + ' ' + u.substring(0, 50));
+    return o;
+}
+
+function muxSegment(info, segBuf, stats, u) {
     var samples = parseSeg(segBuf, stats);
     var v = [];
     var a = [];
@@ -742,10 +764,17 @@ function muxSegment(info, segBuf, stats) {
         else if (info.audio && s.track === info.audio.id) a.push(s);
     }
     if (!v.length && !a.length) return null;
+    // Constant per-stream rebase (see getOffset90k) - video and audio share
+    // the same wall-clock offset so A/V stay aligned.
+    var firstDts = v.length ? v[0].dts : a[0].dts;
+    var firstTs = v.length ? info.video.timescale : info.audio.timescale;
+    var off90 = getOffset90k(u, (firstDts * 90000) / firstTs);
+    var offV = off90 ? (off90 * info.video.timescale) / 90000 : 0;
+    var offA = info.audio && off90 ? (off90 * info.audio.timescale) / 90000 : 0;
     var events = [];
     for (i = 0; i < v.length; i++) {
         var sv = v[i];
-        var dtsV = Math.round((sv.dts * 90000) / info.video.timescale);
+        var dtsV = Math.round(((sv.dts - offV) * 90000) / info.video.timescale);
         var ptsV = dtsV + Math.round((sv.cts * 90000) / info.video.timescale);
         var payloadV = annexb(info.video, segBuf, sv);
         if (!payloadV) continue;
@@ -753,7 +782,7 @@ function muxSegment(info, segBuf, stats) {
     }
     for (i = 0; i < a.length; i++) {
         var sa = a[i];
-        var dtsA = Math.round((sa.dts * 90000) / info.audio.timescale);
+        var dtsA = Math.round(((sa.dts - offA) * 90000) / info.audio.timescale);
         var payloadA = adtsFrame(info.audio, segBuf, sa);
         events.push({t: dtsA, kind: 'a', pts: dtsA, dts: dtsA, payload: payloadA});
     }
@@ -1092,7 +1121,7 @@ function hlsSegment(qs, res) {
             var ts = null;
             var stats = {dropped: 0, total: 0, last: ''};
             try {
-                ts = muxSegment(info, segBuf, stats);
+                ts = muxSegment(info, segBuf, stats, qs.u ? String(qs.u) : '');
             } catch (e) {
                 logLine('hls mux err ' + e.message);
             }
