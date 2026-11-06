@@ -134,6 +134,16 @@
             return;
         }
         var params = parseLaunchParams(eventDetail);
+        // Defensive kick-only guard: the boot activity launches us with
+        // sttv_boot_kick=1. Whether the params show up in PalmSystem at parse
+        // time or later in the launch event detail, NEVER navigate in that
+        // case - only kick startup.sh (ssh+telnet) and close this window.
+        if (params && params.sttv_boot_kick) {
+            debugLog('boot_kick_via_event', {launchEvent: eventName || 'launch'});
+            kickHomebrewStartup();
+            selfCloseApp();
+            return;
+        }
         var target = pickTarget(params);
         debugLog('launch_received', {
             launchEvent: eventName || 'launch',
@@ -150,6 +160,10 @@
         if (!target) return;
         launchNavigationCommitted = true;
         debugLog('launch_navigate', {launchEvent: eventName || 'launch', target: comparableUrl(target)});
+        // Real navigation to the hosted app = a manual open: start sttv_serve
+        // now (it lives only while the app page is open; the bridge heartbeat
+        // keeps it up and stops it after the app closes).
+        ensureSttvServe();
         global.location.replace(target);
     }
     function installLaunchHandlers() {
@@ -248,8 +262,9 @@
         kickHomebrewStartup();
         selfCloseApp();
     } else {
+        // Manual open: handlers navigate to the hosted app (which starts
+        // sttv_serve at the navigation commit point); the kick is idempotent.
         installLaunchHandlers();
         kickHomebrewStartup();
-        ensureSttvServe();
     }
 })(window);
