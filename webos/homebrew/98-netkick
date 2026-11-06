@@ -1,0 +1,114 @@
+#!/bin/sh
+# 98-netkick - boot-time WiFi/connman recovery + diagnostics.
+#
+# On this TV the network comes up "connected" but without working internet
+# after a reboot until something re-evaluates the connection (opening
+# Settings > Network and returning fixes it instantly - its luna calls to
+# com.webos.connectionmanager spawn/re-sync the connection service). This
+# script performs the same poke from boot, verifies REAL internet (DNS+HTTP),
+# disables WiFi power save (mid-session drops), and logs the state so the
+# failure mode stays visible in /tmp/netkick.log (kept for the current boot).
+#
+# Install as /var/lib/webosbrew/init.d/98-netkick (runs as root via
+# startup.sh -> run-parts; startup.sh is kicked by the wrapper app launch and
+# by the com.tbsniller.smarttwitchwebostv.boot activity).
+
+LOG=/tmp/netkick.log
+TARGET_URL='https://tamulus47.github.io/SmartTwitchWebOSTV/release/index.html'
+
+log() {
+    echo "$(date '+%F %T') $*" >> "$LOG" 2>/dev/null
+}
+
+have() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+# Real internet = DNS + HTTP to the hosted app (any 2xx/3xx/4xx = reachable).
+online() {
+    code=$(curl -s -m 6 -o /dev/null -w '%{http_code}' "$TARGET_URL" 2>/dev/null)
+    [ -n "$code" ] && [ "$code" != "000" ]
+}
+
+route_ok() {
+    ip route 2>/dev/null | grep -q default
+}
+
+snapshot() {
+    log "--- state: online=$(online && echo yes || echo no) route=$(route_ok && echo yes || echo no)"
+    ip route 2>/dev/null | head -3 | while read -r l; do log "    route: $l"; done
+    if [ -f /etc/resolv.conf ]; then
+        log "    resolv: $(grep -v '^#' /etc/resolv.conf | tr '\n' ' ')"
+    fi
+    if have connmanctl; then
+        connmanctl services 2>/dev/null | head -6 | while read -r l; do log "    cm: $l"; done
+    else
+        log "    connmanctl: missing"
+    fi
+    if have ping; then
+        if ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1; then log "    ping8888: ok"; else log "    ping8888: FAIL"; fi
+    fi
+}
+
+# The poke that mirrors opening Settings > Network (spawns/re-syncs
+# com.webos.connectionmanager). Both calls are fire-and-forget.
+kick() {
+    if have luna-send; then
+        luna-send -P -n 1 -w 4000 'luna://com.webos.connectionmanager/getStatus' '{}' >/dev/null 2>&1
+        luna-send -P -n 1 -w 4000 'luna://com.webos.connectionmanager/getNetworks' '{}' >/dev/null 2>&1
+    fi
+    # Fallback: drive connman directly if its CLI exists.
+    if have connmanctl; then
+        connmanctl scan wifi >/dev/null 2>&1
+    fi
+}
+
+# Reduce mid-session WiFi drops: turn off power save where the driver exposes it.
+powersave_off() {
+    if have iw; then
+        for iface in $(ls /sys/class/net 2>/dev/null); do
+            case "$iface" in
+                wlan*|wlp*|wifi*|eth*|en*) iw dev "$iface" set power_save off >/dev/null 2>&1 ;;
+            esac
+        done
+    fi
+    for f in /sys/class/net/*/power_save; do
+        [ -w "$f" ] && echo 0 > "$f" 2>/dev/null
+    done
+}
+
+log "=== netkick start (pid $$) ==="
+powersave_off
+log "powersave off attempted"
+
+# Phase 1: wait for interfaces/route to appear (early boot), max ~40s.
+i=0
+while [ $i -lt 20 ]; do
+    if route_ok; then break; fi
+    i=$((i + 1))
+    sleep 2
+done
+log "route ready after ~$((i * 2))s: $(route_ok && echo yes || echo no)"
+
+# Phase 2: wait for REAL internet, kicking the connection stack periodically,
+# max ~6 minutes. Log a full snapshot on every other cycle while broken.
+tries=0
+kick_after=$((15 / 5))   # first poke after ~15s of broken state
+while [ $tries -lt 72 ]; do
+    if online; then
+        log "online after ${tries} x5s"
+        exit 0
+    fi
+    tries=$((tries + 1))
+    if [ $tries -eq 3 ] || [ $((tries % 6)) -eq 0 ]; then
+        snapshot
+    fi
+    if [ $tries -ge $kick_after ]; then
+        kick
+    fi
+    sleep 5
+done
+
+log "STILL OFFLINE after ~6 min - giving up (settings > network open can still fix it)"
+snapshot
+exit 0
