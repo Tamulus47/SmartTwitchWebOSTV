@@ -1437,7 +1437,13 @@
 
         // loadedmetadata: metadata (duration, dimensions) available. Resume VOD/clip position.
         mv.addEventListener('loadedmetadata', function () {
-            if (ms.resume > 0 && (ms.type === 2 || ms.type === 3)) try { mv.currentTime = Math.max(0, ms.resume / 1000); } catch (e) {}
+            var resumeTarget = ms.resume;
+            if (resumeTarget > 0 && (ms.type === 2 || ms.type === 3)) {
+                bridgeDebugLog('resume_seek', {resume: resumeTarget, type: ms.type, ct: mtime()});
+                try { mv.currentTime = Math.max(0, resumeTarget / 1000); } catch (e) {}
+            } else {
+                bridgeDebugLog('resume_skip', {resume: resumeTarget, type: ms.type, ct: mtime()});
+            }
             call('Play_UpdateDuration', [getMainDurationMs()]);
             mainErrorCount = 0;
             clearMainStallTimer();
@@ -5501,7 +5507,7 @@
                 if (!isFinite(ms.resume)) ms.resume = 0;
                 ms.uri = tg;
                 startMainPlayback(); // fetch the new playlist, restart MSE or native
-                bridgeDebugLog('set_quality_applied', {pos: ms.qp, available: ms.q.length, mse: true});
+                bridgeDebugLog('set_quality_applied', {pos: ms.qp, available: ms.q.length, mse: true, resume: ms.resume, type: ms.type});
                 return;
             }
             if (mainStreamFormat === 'ts') {
@@ -5525,7 +5531,7 @@
             if (!isFinite(ms.resume)) ms.resume = 0;
             ms.uri = tg;
             startMainPlayback();
-            bridgeDebugLog('set_quality_applied', {pos: ms.qp, available: ms.q.length, flow: 'full-probe'});
+            bridgeDebugLog('set_quality_applied', {pos: ms.qp, available: ms.q.length, flow: 'full-probe', resume: ms.resume, type: ms.type});
         };
         // IMPLEMENTED: Returns available quality options as JSON array.
         A.getQualities = function () {
