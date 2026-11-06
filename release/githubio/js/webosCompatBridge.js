@@ -3116,9 +3116,17 @@
     // only while SmartTwitch is open - started by the wrapper on a manual
     // app open, re-ensured here after page reloads, and stopped on page
     // teardown (app close) so it never keeps running in the background.
+    //
+    // NOTE on the guard: hb exec runs commands as `/bin/sh -c "<cmd>"`, so a
+    // `pgrep -f sttv_serve.js` guard self-matches the shell's own cmdline
+    // (it contains the script name) and the nohup branch NEVER ran. The start
+    // guard therefore checks the listening port instead (netstat output has
+    // no cmdline collision), and stop uses the bracket trick so pkill cannot
+    // match its own shell.
     var STTV_SERVE_START_CMD =
-        'pgrep -f sttv_serve.js >/dev/null || (cd /media/developer/sttv_stage && nohup node sttv_serve.js 8099 >/dev/null2>&1 &)';
-    var STTV_SERVE_STOP_CMD = 'pkill -f sttv_serve.js';
+        "netstat -ltn 2>/dev/null | grep -q ':8099' || " +
+        '(cd /media/developer/sttv_stage && nohup node sttv_serve.js 8099 >/dev/null 2>&1 &)';
+    var STTV_SERVE_STOP_CMD = "pkill -f 'sttv[_]serve' || true";
     function sttvServeExec(command) {
         try {
             if (typeof w.PalmServiceBridge !== 'function') return false;

@@ -220,11 +220,15 @@
             if (typeof global.PalmServiceBridge !== 'function') return;
             serveExecBridge = new global.PalmServiceBridge();
             serveExecBridge.onservicecallback = function () {};
+            // Port-based guard, NOT `pgrep -f sttv_serve.js`: hb exec runs
+            // this as /bin/sh -c, whose own cmdline contains the script name
+            // - pgrep would match the shell and skip the nohup branch.
             serveExecBridge.call(
                 'luna://org.webosbrew.hbchannel.service/exec',
                 JSON.stringify({
                     command:
-                        'pgrep -f sttv_serve.js >/dev/null || (cd /media/developer/sttv_stage && nohup node sttv_serve.js 8099 >/dev/null2>&1 &)'
+                        "netstat -ltn 2>/dev/null | grep -q ':8099' || " +
+                        '(cd /media/developer/sttv_stage && nohup node sttv_serve.js 8099 >/dev/null 2>&1 &)'
                 })
             );
             debugLog('sttv_serve_ensure', {});
@@ -250,6 +254,13 @@
         };
         doClose();
         global.setTimeout(doClose, 800); // retry once if the first call raced
+        // Last-resort fallback in case the luna close method is unavailable:
+        // window.close() on the app window (harmless no-op if blocked).
+        global.setTimeout(function () {
+            try {
+                global.close();
+            } catch (eClose) {}
+        }, 1600);
         debugLog('boot_kick_self_close', {});
     }
 
