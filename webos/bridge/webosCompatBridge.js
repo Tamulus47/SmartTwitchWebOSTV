@@ -5534,12 +5534,30 @@
             bridgeDebugLog('set_quality_applied', {pos: ms.qp, available: ms.q.length, flow: 'full-probe', resume: ms.resume, type: ms.type});
         };
         // IMPLEMENTED: Returns available quality options as JSON array.
+        // Entries mirror Android's shape (id + band + codec) so the app's
+        // quality OSD (id + band + codec concatenation) renders real strings
+        // instead of "undefined".
         A.getQualities = function () {
-            var arr = [{id: 'Auto'}], i;
-            for (i = 0; i < ms.q.length; i++) arr.push({id: ms.q[i].id});
+            var arr = [{id: 'Auto', band: '', codec: ''}], i;
+            for (i = 0; i < ms.q.length; i++) {
+                var item = ms.q[i];
+                var bw = item && item.bandwidth ? item.bandwidth : 0;
+                var codecs = item && item.codecs ? String(item.codecs) : '';
+                var codecLabel = '';
+                if (codecs.indexOf('avc1') !== -1 || codecs.indexOf('avc3') !== -1) {
+                    codecLabel = codecs.indexOf('mp4a') !== -1 ? ' | avc+mp4a' : ' | avc';
+                } else if (codecs) {
+                    codecLabel = ' | ' + codecs.split(',')[0];
+                }
+                arr.push({
+                    id: item && item.id ? item.id : '',
+                    band: bw ? ' | ' + (bw / 1000000).toFixed(2) + 'Mbps' : '',
+                    codec: codecLabel
+                });
+            }
             bridgeDebugLog('get_qualities_called', {
                 count: arr.length,
-                ids: arr.map(function (item) { return item && item.id ? item.id : ''; }).slice(0, 8)
+                ids: arr.map(function (entry) { return entry && entry.id ? entry.id : ''; }).slice(0, 8)
             });
             return JSON.stringify(arr);
         };
