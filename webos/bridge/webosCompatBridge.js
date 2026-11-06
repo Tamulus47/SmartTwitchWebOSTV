@@ -3186,14 +3186,17 @@
     // --- stall recovery watchdog ------------------------------------------
     // The platform player occasionally wedges on remuxed fMP4 live (audio +
     // video stop, ct pinned at buffered-end+1, loader still downloading) - a
-    // platform/HLS live-quirk that survived the EOS-NAL strip. Recover by
-    // restarting the player through the proven full probe flow
-    // (RestartPlayer -> probe -> remux attach) as soon as a stall is
-    // confirmed: ct unchanged for >=10s while playing, then re-attach (cool
-    // down15s so probe storms cannot happen; debug-logged either way).
+    // platform/HLS live-quirk that survived the EOS-NAL strip. Recovery via
+    // RestartPlayer (full probe flow) ONLY for mid-playback wedges: it arms
+    // only after real progress (ct >=30) and a >=15s frozen clock, then resets
+    // its progress bar so it cannot hot-loop during warm-up (a re-attach needs
+    // ~10-20s to start advancing; restarting before that starves playback
+    // forever). An attach-phase stall (never reached30s) retries at most once
+    // every2 minutes.
     var sttvStallLastCt = -1;
     var sttvStallSince = 0;
     var sttvStallLastRestart = 0;
+    var sttvStallBestCt = 0;
     function sttvStallWatchdog() {
         try {
             var v = mv;
@@ -3203,28 +3206,34 @@
                 return;
             }
             var ct = v.currentTime || 0;
+            if (ct > sttvStallBestCt + 0.5) {
+                sttvStallBestCt = ct > sttvStallBestCt ? ct : sttvStallBestCt;
+            }
             if (ct !== sttvStallLastCt) {
                 sttvStallLastCt = ct;
                 sttvStallSince = 0;
                 return;
             }
-            if (ct <= 0.5) return; // still loading from scratch
+            if (ct <= 0.5) return; // loading from scratch
             var now = Date.now();
             if (!sttvStallSince) {
                 sttvStallSince = now;
                 return;
             }
-            if (now - sttvStallSince >= 10000 && now - sttvStallLastRestart >= 15000) {
-                sttvStallLastRestart = now;
-                sttvStallSince = 0;
-                bridgeDebugLog('stall_recovery_restart', {ct: ct, stalledFor: now - sttvStallSince});
-                try {
-                    if (w.Android && typeof w.Android.RestartPlayer === 'function') {
-                        w.Android.RestartPlayer();
-                    }
-                } catch (eRestart) {
-                    bridgeDebugLog('stall_recovery_error', {error: String(eRestart)});
+            if (now - sttvStallSince < 15000) return;
+            var armed = sttvStallBestCt >= 30; // real playback happened
+            var cooldown = armed ? 15000 : 120000;
+            if (now - sttvStallLastRestart < cooldown) return;
+            sttvStallLastRestart = now;
+            sttvStallSince = 0;
+            sttvStallBestCt = 0; // must re-earn "armed" after the restart
+            bridgeDebugLog('stall_recovery_restart', {ct: ct, best: sttvStallBestCt, armed: armed});
+            try {
+                if (w.Android && typeof w.Android.RestartPlayer === 'function') {
+                    w.Android.RestartPlayer();
                 }
+            } catch (eRestart) {
+                bridgeDebugLog('stall_recovery_error', {error: String(eRestart)});
             }
         } catch (eWd) {}
     }
