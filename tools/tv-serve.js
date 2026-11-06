@@ -829,8 +829,49 @@ var varCacheOrder = [];
 var varInterest = {};
 var varTimers = {};
 var varBusy = {};
+// Monotonic-accept guard: a playlist snapshot whose MEDIA-SEQUENCE moves
+// BACKWARD (Twitch edge/session hiccups deliver older windows occasionally -
+// observed serving seq2766 while upstream was at4413, and buffers walking
+// backward21->17->13) makes the platform player rewind and wedge (frame ->
+// spinner -> frame). Stale snapshots are rejected; only forward progress (or
+// a clearly-forward PDT with a lower seq = upstream session reset) is cached.
+var varMeta = {};
+
+function playlistMeta(text) {
+    var meta = { seq: null, pdt: null };
+    var m = text.match(/#EXT-X-MEDIA-SEQUENCE:(\d+)/);
+    if (m) meta.seq = parseInt(m[1], 10);
+    m = text.match(/#EXT-X-PROGRAM-DATE-TIME:([0-9:\-\+.Z]+)/);
+    if (m) {
+        var t = Date.parse(m[1]);
+        if (!isNaN(t)) meta.pdt = t;
+    }
+    return meta;
+}
+
+function acceptVariant(u, text) {
+    var meta = playlistMeta(text);
+    var prev = varMeta[u];
+    if (!prev || meta.seq === null || prev.seq === null) {
+        varMeta[u] = meta;
+        return true;
+    }
+    if (meta.seq >= prev.seq) {
+        varMeta[u] = meta;
+        return true;
+    }
+    // Sequence went backward: accept only a legit timeline reset (first PDT
+    // not older than the current window); otherwise it's a stale snapshot.
+    if (meta.pdt !== null && prev.pdt !== null && meta.pdt >= prev.pdt - 2000) {
+        varMeta[u] = meta;
+        return true;
+    }
+    logLine('hls var REGRESSION rejected seq ' + meta.seq + ' < ' + prev.seq + ' ' + u.substring(0, 60));
+    return false;
+}
 
 function rememberVariant(u, text) {
+    if (!acceptVariant(u, text)) return; // keep last accepted (monotonic)
     varCache[u] = text;
     var idx = varCacheOrder.indexOf(u);
     if (idx >= 0) varCacheOrder.splice(idx, 1);

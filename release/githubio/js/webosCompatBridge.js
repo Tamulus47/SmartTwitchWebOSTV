@@ -3233,11 +3233,12 @@
                 return;
             }
             var elapsed = now - sttvStallSince;
-            // Gap-buster: ONLY when actually stalled >=10s and the playhead
-            // sits beyond the buffered end (the wedge signature) - not during
-            // normal frontier-riding play where ct is naturally bufEnd+~1.
+            // Gap-buster: ONE attempt per stall episode only (each seek renders
+            // as frame+spinner; the restart is the real recovery) and only on
+            // genuine stasis with the frontier signature - never during normal
+            // frontier-riding play.
             var be = v.buffered && v.buffered.length ? v.buffered.end(v.buffered.length - 1) : -1;
-            if (elapsed >= 10000 && be >= 0 && ct > be + 0.5 && now - sttvStallLastSeek >= 6000 && sttvStallSeeks < 3) {
+            if (elapsed >= 10000 && be >= 0 && ct > be + 0.5 && now - sttvStallLastSeek >= 6000 && sttvStallSeeks < 1) {
                 sttvStallLastSeek = now;
                 sttvStallSeeks++;
                 var target = Math.max(0, be - 3);
@@ -3245,10 +3246,11 @@
                 try { v.currentTime = target; } catch (eSeek) {}
                 return;
             }
-            // Restart only after real stasis (>=25s) or3 fruitless gap-seeks.
-            if (elapsed < 25000 && sttvStallSeeks < 3) return;
+            // Restart only after real stasis (>=25s) - by then the single
+            // gap-seek attempt has had its chance.
+            if (elapsed < 25000) return;
             var armed = sttvStallBestCt >= 30;
-            var cooldown = armed ? 15000 : 90000;
+            var cooldown = armed ? 15000 : 30000; // attach-phase wedge: retry every30s
             if (now - sttvStallLastRestart < cooldown) return;
             sttvStallLastRestart = now;
             sttvStallSince = 0;
