@@ -142,3 +142,41 @@ Test harnesses for this investigation live in the session helpers (`expr_*.js` r
 `tv_overlap.js`, `tv_boxes2.js`, `tv_init.js`, `tv_avcc.js` on the TV; PC-side
 `test_remux.js` validates the transmuxed TS byte-for-byte — sync/PID/CC continuity, PAT/PMT
 CRC + program mapping, PES headers/lengths, DTS ordering, ADTS framing).
+
+## Boot: ssh + remux server without opening any app
+
+Two hooks make the rooted extras start at every boot (verified end-to-end):
+
+1. Persistent webOS activity `com.tbsniller.smarttwitchwebostv.boot`
+   (created via `luna://com.webos.service.activitymanager/create`, callback
+   `com.webos.applicationManager/launch` of the wrapper - stock-public, so the
+   activity manager's rights check passes; the app's group membership lives in
+   `/var/luna-service2/client-permissions.d/com.tbsniller.smarttwitchwebostv.app.json`).
+   It fires on `bootManager core-boot-done` and launches the wrapper app.
+2. The wrapper's `index.js` kicks `org.webosbrew.hbchannel.service/autostart`
+   on every launch (fire-and-forget, idempotent per boot), which runs
+   `/var/lib/webosbrew/startup.sh` as root: dropbear (ssh) plus
+   `run-parts /var/lib/webosbrew/init.d` - our `99-sttv-serve` (source:
+   `webos/homebrew/99-sttv-serve`) starts the local remux server.
+
+Homebrew Channel was upgraded0.6.3 -> 0.7.3 on this TV (backup:
+`/media/developer/hb_backup_063.tgz`); its service registers the same boot
+activity via `registerActivity` for its own startup.
+
+## Quality switching (fMP4 VOD)
+
+Quality changes keep the remux route alive on any page state:
+
+- `SetQuality` with an unknown stream format (typical after a session restore
+  whose first probe failed) runs the full probe flow instead of attaching the
+  raw fMP4 variant URL (which stalls forever on webOS 3.4). Known-TS streams
+  keep the instant native swap.
+- The format probe self-heals: on total failure (luna service cold start,
+  WiFi blip) it re-probes every 8s (8 rounds, generation-guarded) instead of
+  giving up - a failed restore probe no longer leaves the player spinning.
+- The stall watchdog only snapshots a resume position when `currentTime` is
+  non-zero, so the raw-attach -> remux swap cannot wipe a pending VOD resume
+  (switching quality used to restart from0).
+- `getQualities` returns the Android contract fields (`band`/`codec`), so
+  the quality OSD renders `480p30 | 1.35Mbps | avc+mp4a` instead of
+  undefined/garbage suffixes.
