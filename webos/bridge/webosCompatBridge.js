@@ -3183,6 +3183,53 @@
     }
     sttvHeartbeatTimerId = w.setInterval(sttvServeHeartbeat, 10000);
 
+    // --- stall recovery watchdog ------------------------------------------
+    // The platform player occasionally wedges on remuxed fMP4 live (audio +
+    // video stop, ct pinned at buffered-end+1, loader still downloading) - a
+    // platform/HLS live-quirk that survived the EOS-NAL strip. Recover by
+    // restarting the player through the proven full probe flow
+    // (RestartPlayer -> probe -> remux attach) as soon as a stall is
+    // confirmed: ct unchanged for >=10s while playing, then re-attach (cool
+    // down15s so probe storms cannot happen; debug-logged either way).
+    var sttvStallLastCt = -1;
+    var sttvStallSince = 0;
+    var sttvStallLastRestart = 0;
+    function sttvStallWatchdog() {
+        try {
+            var v = mv;
+            if (!v || !v.src || v.paused) {
+                sttvStallSince = 0;
+                sttvStallLastCt = -1;
+                return;
+            }
+            var ct = v.currentTime || 0;
+            if (ct !== sttvStallLastCt) {
+                sttvStallLastCt = ct;
+                sttvStallSince = 0;
+                return;
+            }
+            if (ct <= 0.5) return; // still loading from scratch
+            var now = Date.now();
+            if (!sttvStallSince) {
+                sttvStallSince = now;
+                return;
+            }
+            if (now - sttvStallSince >= 10000 && now - sttvStallLastRestart >= 15000) {
+                sttvStallLastRestart = now;
+                sttvStallSince = 0;
+                bridgeDebugLog('stall_recovery_restart', {ct: ct, stalledFor: now - sttvStallSince});
+                try {
+                    if (w.Android && typeof w.Android.RestartPlayer === 'function') {
+                        w.Android.RestartPlayer();
+                    }
+                } catch (eRestart) {
+                    bridgeDebugLog('stall_recovery_error', {error: String(eRestart)});
+                }
+            }
+        } catch (eWd) {}
+    }
+    w.setInterval(sttvStallWatchdog, 3000);
+
     // Starts main playback for ms.uri. Native HLS is attached immediately (no
     // added delay for MPEG-TS channels) while a parallel probe fetches the
     // media playlist; if it is fMP4 we swap to the MSE pump. Generation
