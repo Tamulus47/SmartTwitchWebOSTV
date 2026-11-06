@@ -150,11 +150,7 @@
         if (!target) return;
         launchNavigationCommitted = true;
         debugLog('launch_navigate', {launchEvent: eventName || 'launch', target: comparableUrl(target)});
-        if (isHttpUrl(target)) {
-            gatedNavigate(target);
-        } else {
-            global.location.replace(target);
-        }
+        global.location.replace(target);
     }
     function installLaunchHandlers() {
         if (launchHandlersInstalled || !global.document || typeof global.document.addEventListener !== 'function') return;
@@ -178,88 +174,6 @@
     }
 
     installLaunchHandlers();
-
-    // --- Boot-time network gate --------------------------------------------
-    // The boot activity launches this wrapper at core-boot-done, which on this
-    // TV can be BEFORE connman finishes bringing WiFi up. Symptom it fixes:
-    // after a reboot the app starts while the network is "connected" but has
-    // no internet (app shows the no-network error) and only opening
-    // Settings > Network and returning recovers it - that page's luna calls to
-    // com.webos.connectionmanager re-apply/spawn the connection stack. So:
-    //   1) poke the same connectionmanager APIs (spawns/re-syncs it), and
-    //   2) wait for REAL internet (XHR against the hosted app origin; GitHub
-    //      Pages answers with Access-Control-Allow-Origin: *) before loading
-    //      the app. A healthy TV passes the first probe in well under a second.
-    var NET_GATE_MAX_WAIT_MS = 45000;
-    var NET_GATE_INTERVAL_MS = 1500;
-    var netGateKickBridges = [];
-
-    function netGateKick() {
-        try {
-            if (typeof global.PalmServiceBridge !== 'function') return;
-            var uris = ['luna://com.webos.connectionmanager/getStatus', 'luna://com.webos.connectionmanager/getNetworks'];
-            for (var i = 0; i < uris.length; i++) {
-                var b = new global.PalmServiceBridge();
-                netGateKickBridges.push(b); // retain: no GC before the reply
-                b.onservicecallback = function () {};
-                b.call(uris[i], '{}');
-            }
-            debugLog('net_gate_kick', {});
-        } catch (e) {
-            debugLog('net_gate_kick_error', {error: String(e)});
-        }
-    }
-
-    function netGateProbe(target, cb) {
-        var done = false;
-        var finish = function (ok) {
-            if (done) return;
-            done = true;
-            try {
-                global.clearTimeout(timer);
-            } catch (e) {}
-            cb(ok);
-        };
-        var timer = global.setTimeout(function () {
-            finish(false);
-        }, 5000);
-        try {
-            var xhr = new XMLHttpRequest();
-            xhr.open('GET', target + (target.indexOf('?') === -1 ? '?' : '&') + 'netgate=' + Date.now(), true);
-            xhr.timeout = 5000;
-            xhr.onload = function () {
-                finish(xhr.status >= 200 && xhr.status < 400);
-            };
-            xhr.onerror = function () {
-                finish(false);
-            };
-            xhr.ontimeout = function () {
-                finish(false);
-            };
-            xhr.send();
-        } catch (e) {
-            finish(false);
-        }
-    }
-
-    function gatedNavigate(target) {
-        var startedAt = Date.now();
-        var attempt = 0;
-        var run = function () {
-            attempt++;
-            if (attempt === 1 || attempt % 4 === 3) netGateKick(); // poke now and every ~6s
-            netGateProbe(target, function (ok) {
-                if (ok || Date.now() - startedAt >= NET_GATE_MAX_WAIT_MS) {
-                    debugLog('net_gate_done', {attempt: attempt, ok: ok, waitedMs: Date.now() - startedAt});
-                    global.location.replace(target);
-                    return;
-                }
-                global.setTimeout(run, NET_GATE_INTERVAL_MS);
-            });
-        };
-        debugLog('net_gate_start', {});
-        run();
-    }
 
     // Kick the Homebrew Channel startup script on every wrapper launch. The
     // boot-time launch is armed as a persistent webOS activity (callback =

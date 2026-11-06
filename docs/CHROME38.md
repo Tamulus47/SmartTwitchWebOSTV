@@ -180,22 +180,3 @@ Quality changes keep the remux route alive on any page state:
 - `getQualities` returns the Android contract fields (`band`/`codec`), so
   the quality OSD renders `480p30 | 1.35Mbps | avc+mp4a` instead of
   undefined/garbage suffixes.
-## Boot network gate (WiFi error after reboot)
-
-After a reboot this TV's WiFi can be "connected" but have no working internet
-for a while; the app then shows the no-network error and only recovers after
-opening Settings > Network and going back (that page's luna calls to
-`com.webos.connectionmanager` re-apply/spawn the connection stack). Two
-layers remove the manual step:
-
-- `webos/app/index.js` gates the navigation to the hosted app: it pokes
-  `connectionmanager/getStatus` + `getNetworks` (same as the settings
-  page) and waits for a real XHR to the app origin (GitHub Pages sends
-  `Access-Control-Allow-Origin: *`) - up to45s, probing every1.5s. Healthy
-  TVs navigate after the first probe (<1s).
-- `webos/homebrew/98-netkick` (installed to
-  `/var/lib/webosbrew/init.d/`) runs at boot as root: waits for route+DNS+HTTP
-  to the app origin, performs the same connectionmanager poke every cycle once
-  the broken state persists, disables WiFi power save (reduces mid-session
-  drops observed as ENETUNREACH), and snapshots route/DNS/connman state to
-  `/tmp/netkick.log` while broken so the failure mode stays diagnosable.
