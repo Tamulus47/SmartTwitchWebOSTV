@@ -2230,7 +2230,13 @@
         clearMainDecoderJamRecoveryTimer();
         mainErrorCount += 1;
         requestMainLoadingShow();
-        if (ms.type === 2 || ms.type === 3) ms.resume = mtime();
+        if (ms.type === 2 || ms.type === 3) {
+            // Only snapshot a REAL position: during a src swap (emptied) or a
+            // cold-start stall currentTime is 0 and would wipe a pending
+            // resume seek (quality switch restarted VOD from the beginning).
+            var savedResume = mtime();
+            if (savedResume > 0) ms.resume = savedResume;
+        }
         w.setTimeout(function () {
             if (!isMainActive() || !mv) return;
             var loadNow = Date.now();
@@ -2252,7 +2258,10 @@
         if (previewErrorCount >= 2) return false;
         previewErrorCount += 1;
         requestFeedLoadingShow();
-        if (ps.type === 2) ps.resume = ptime();
+        if (ps.type === 2) {
+            var savedPreviewResume = ptime();
+            if (savedPreviewResume > 0) ps.resume = savedPreviewResume;
+        }
         w.setTimeout(function () {
             if (!isPreviewActive() || !pv) return;
             try {
