@@ -9,7 +9,7 @@
   "icon": "assets/icon.png",
   "largeIcon": "assets/icon.png",
   "splashBackground": "assets/splash.png",
-  "iconColor": "#303030",
+  "iconColor": "#9146FF",
   "checkUpdateOnLaunch": false,
   "supportGIP": true,
   "supportQuickStart": false,
