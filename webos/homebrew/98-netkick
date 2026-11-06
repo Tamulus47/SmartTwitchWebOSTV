@@ -31,7 +31,11 @@ online() {
 }
 
 route_ok() {
-    ip route 2>/dev/null | grep -q default
+    if ip route 2>/dev/null | grep -q default; then
+        return 0
+    fi
+    # busybox fallback
+    route -n 2>/dev/null | grep -q '^0.0.0.0'
 }
 
 snapshot() {
@@ -77,6 +81,11 @@ powersave_off() {
     done
 }
 
+# NOTE: everything below runs BACKGROUNDed - run-parts executes init.d
+# scripts synchronously, and this script may wait several minutes for the
+# network; backgrounding keeps99-sttv-serve (remux server) and the rest of
+# startup.sh from being delayed by it.
+main() {
 log "=== netkick start (pid $$) ==="
 powersave_off
 log "powersave off attempted"
@@ -111,4 +120,9 @@ done
 
 log "STILL OFFLINE after ~6 min - giving up (settings > network open can still fix it)"
 snapshot
+exit 0
+}
+
+# Background ourselves so run-parts/startup.sh continue immediately.
+( main ) >/dev/null 2>&1 &
 exit 0
