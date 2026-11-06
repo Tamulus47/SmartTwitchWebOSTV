@@ -3198,6 +3198,7 @@
     var sttvStallLastRestart = 0;
     var sttvStallBestCt = 0;
     var sttvStallLastSeek = 0;
+    var sttvStallSeeks = 0;
     function sttvStallWatchdog() {
         try {
             var v = mv;
@@ -3207,28 +3208,22 @@
                 return;
             }
             var ct = v.currentTime || 0;
-            if (ct > sttvStallBestCt + 0.5) sttvStallBestCt = ct;
-            // GAP BUSTER: the wedge signature is playhead BEYOND buffered end
-            // (ct = bufEnd + ~1): the player waits for data its live logic
-            // never fetches. Pull the playhead back into the buffered range so
-            // normal playback/live catch-up can resume - much cheaper and
-            // faster than a restart.
-            var be = v.buffered && v.buffered.length ? v.buffered.end(v.buffered.length - 1) : -1;
-            if (be >= 0 && ct > be + 0.5 && Date.now() - sttvStallLastSeek >= 5000) {
-                sttvStallLastSeek = Date.now();
-                var target = Math.max(0, be - 3);
-                bridgeDebugLog('stall_gap_seek', {ct: ct, bufEnd: be, to: target});
-                try { v.currentTime = target; } catch (eSeek) {}
+            // REAL progress = new personal best. Only this counts as recovery;
+            // backward seek movement must not reset the stall clock (otherwise
+            // the gap-buster can cycle forever: seek -> one frame -> stall ->
+            // seek ... which shows as frame-by-frame slideshow with no audio).
+            if (ct > sttvStallBestCt + 0.5) {
+                sttvStallBestCt = ct;
                 sttvStallSince = 0;
                 sttvStallLastCt = -1;
+                sttvStallSeeks = 0;
                 return;
             }
-            // Jitter-proof stall clock: sub-second oscillation (22.03 <-> 22.23)
-            // must not reset the timer - compare whole seconds.
+            // Jitter-proof stall clock (whole seconds).
             var key = Math.floor(ct);
             if (key !== sttvStallLastCt) {
                 sttvStallLastCt = key;
-                sttvStallSince = 0;
+                if (!sttvStallSince) sttvStallSince = Date.now();
                 return;
             }
             if (key <= 0) return;
@@ -3237,14 +3232,29 @@
                 sttvStallSince = now;
                 return;
             }
-            if (now - sttvStallSince < 25000) return; // >=25s truly static
+            var elapsed = now - sttvStallSince;
+            // Gap-buster: ONLY when actually stalled >=10s and the playhead
+            // sits beyond the buffered end (the wedge signature) - not during
+            // normal frontier-riding play where ct is naturally bufEnd+~1.
+            var be = v.buffered && v.buffered.length ? v.buffered.end(v.buffered.length - 1) : -1;
+            if (elapsed >= 10000 && be >= 0 && ct > be + 0.5 && now - sttvStallLastSeek >= 6000 && sttvStallSeeks < 3) {
+                sttvStallLastSeek = now;
+                sttvStallSeeks++;
+                var target = Math.max(0, be - 3);
+                bridgeDebugLog('stall_gap_seek', {ct: ct, bufEnd: be, to: target, n: sttvStallSeeks});
+                try { v.currentTime = target; } catch (eSeek) {}
+                return;
+            }
+            // Restart only after real stasis (>=25s) or3 fruitless gap-seeks.
+            if (elapsed < 25000 && sttvStallSeeks < 3) return;
             var armed = sttvStallBestCt >= 30;
             var cooldown = armed ? 15000 : 90000;
             if (now - sttvStallLastRestart < cooldown) return;
             sttvStallLastRestart = now;
             sttvStallSince = 0;
             sttvStallBestCt = 0;
-            bridgeDebugLog('stall_recovery_restart', {ct: ct, armed: armed});
+            sttvStallSeeks = 0;
+            bridgeDebugLog('stall_recovery_restart', {ct: ct, armed: armed, seeks: sttvStallSeeks});
             try {
                 if (w.Android && typeof w.Android.RestartPlayer === 'function') {
                     w.Android.RestartPlayer();
