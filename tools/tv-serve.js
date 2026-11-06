@@ -745,7 +745,12 @@ function getOffset90k(u, raw90) {
     var o = ptsOffset[u];
     if (o !== undefined) return o;
     if (raw90 < 1073741824) return 0; // below2^30: already platform-safe
-    o = raw90;
+    // Headroom of600s: the first-seen segment may be the LIVE EDGE while the
+    // player backfills earlier in-window segments (<30s older) - they must
+    // stay positive. Rebased values reach2^31 only after ~6.4h of unbroken
+    // same-session playback (any reload/quality change re-keys via m=).
+    o = raw90 - 54000000;
+    if (o < 0) o = 0;
     ptsOffset[u] = o;
     ptsOffsetOrder.push(u);
     while (ptsOffsetOrder.length > 8) delete ptsOffset[ptsOffsetOrder.shift()];
