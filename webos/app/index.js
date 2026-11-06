@@ -140,8 +140,7 @@
         // case - only kick startup.sh (ssh+telnet) and close this window.
         if (params && params.sttv_boot_kick) {
             debugLog('boot_kick_via_event', {launchEvent: eventName || 'launch'});
-            kickHomebrewStartup();
-            selfCloseApp();
+            bootKickWithRetry(); // kicks, then closes this window
             return;
         }
         var target = pickTarget(params);
@@ -196,11 +195,25 @@
     // nothing. Note: sttv_serve is NOT part of this chain - it starts only
     // with a manual app open (ensureSttvServe below) and stops on close.
     var homebrewKickBridge = null;
-    function kickHomebrewStartup() {
+    function kickHomebrewStartup(onResult) {
         try {
-            if (typeof global.PalmServiceBridge !== 'function') return;
+            if (typeof global.PalmServiceBridge !== 'function') {
+                if (onResult) onResult(false);
+                return;
+            }
             homebrewKickBridge = new global.PalmServiceBridge();
-            homebrewKickBridge.onservicecallback = function () {};
+            var settled = false;
+            var settle = function (ok) {
+                if (settled) return;
+                settled = true;
+                if (onResult) onResult(ok);
+            };
+            homebrewKickBridge.onservicecallback = function () {
+                settle(true);
+            };
+            homebrewKickBridge.onserviceerror = function () {
+                settle(false);
+            };
             homebrewKickBridge.call(
                 'luna://org.webosbrew.hbchannel.service/autostart',
                 '{"reason":"sttv-wrapper"}'
@@ -208,6 +221,41 @@
             debugLog('homebrew_kick_sent', {});
         } catch (e) {
             debugLog('homebrew_kick_error', {error: String(e)});
+            if (onResult) onResult(false);
+        }
+    }
+
+    // Boot-time kick with retries: at core-boot-done the Homebrew service
+    // may not be registered yet, and a single fire-and-forget call would be
+    // lost (observed on TV: boot with no dropbear). Retry on error until the
+    // service answers (startup.sh is idempotent), then self-close; hard
+    // timeout so the placeholder window never lingers.
+    var bootKickAttempts = 0;
+    var bootKickSettled = false;
+    function bootKickClose() {
+        if (bootKickSettled) return;
+        bootKickSettled = true;
+        selfCloseApp();
+    }
+    function bootKickWithRetry() {
+        if (bootKickSettled) return;
+        bootKickAttempts++;
+        kickHomebrewStartup(function (ok) {
+            if (ok) {
+                debugLog('boot_kick_ok', {attempt: bootKickAttempts});
+                bootKickClose();
+                return;
+            }
+            if (bootKickAttempts >= 4) {
+                debugLog('boot_kick_give_up', {attempt: bootKickAttempts});
+                bootKickClose();
+                return;
+            }
+            debugLog('boot_kick_retry', {attempt: bootKickAttempts});
+            global.setTimeout(bootKickWithRetry, 2000 * bootKickAttempts);
+        });
+        if (bootKickAttempts === 1) {
+            global.setTimeout(bootKickClose, 12000); // absolute cap
         }
     }
     // sttv_serve (local fMP4->TS remux server) lifecycle: it must run ONLY
@@ -270,8 +318,10 @@
     var bootKickParams = parseLaunchParams(null);
     if (bootKickParams && bootKickParams.sttv_boot_kick) {
         debugLog('boot_kick_only', {});
-        kickHomebrewStartup();
-        selfCloseApp();
+        // Kick with retries + self-close on acknowledgement (or after the
+        //12s cap): at core-boot-done the Homebrew service may not be
+        // registered yet, and a single fire-and-forget kick is lost.
+        bootKickWithRetry();
     } else {
         // Manual open: handlers navigate to the hosted app (which starts
         // sttv_serve at the navigation commit point); the kick is idempotent.
