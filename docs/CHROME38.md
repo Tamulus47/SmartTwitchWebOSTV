@@ -127,9 +127,12 @@ for out-of-bounds samples (ad-inserted segments whose init does not match get sk
 of failing the whole segment), LRU segment-TS cache, and timestamped request logging to
 `/tmp/httpd.log`.
 
-**Deployment**: copy `tools/tv-serve.js` to `/media/developer/sttv_stage/sttv_serve.js` and run
-`node sttv_serve.js 8099` (autostart via `/var/lib/webosbrew/startup.sh`). Without the server,
-fMP4 content fails fast (health check misses → MSE fallback → the existing error dialog).
+**Deployment**: copy `tools/tv-serve.js` to `/media/developer/sttv_stage/sttv_serve.js`.
+The server is **not** autostarted anymore: it starts only with a manual app open
+(wrapper/bridge `ensureSttvServe`, `pgrep`-guarded) and stops when the app closes
+(unload hook + 90s heartbeat timeout, see the boot section). Without the server,
+fMP4 content fails fast (health check misses → one ensure retry → MSE fallback →
+the existing error dialog).
 
 **Validation**: Pisty VOD `2919603413` transmuxes and plays continuously on the TV
 (`readyState=4`, `currentTime` 0→47s+, buffered 0→200s, no stalls). Because segment fetches
@@ -143,23 +146,47 @@ Test harnesses for this investigation live in the session helpers (`expr_*.js` r
 `test_remux.js` validates the transmuxed TS byte-for-byte — sync/PID/CC continuity, PAT/PMT
 CRC + program mapping, PES headers/lengths, DTS ordering, ADTS framing).
 
-## Boot: ssh + remux server without opening any app
+## Boot: ssh + telnet at boot, app + remux server only when opened
 
-Two hooks make the rooted extras start at every boot (verified end-to-end):
+Design goal: at every TV boot the rooted extras — dropbear (ssh) and telnetd —
+start by themselves (no need to open the Homebrew Channel manually), while the
+SmartTwitch app itself does **not** auto-launch (keeps TV performance) and the
+local remux server runs **only while the app is open**.
 
 1. Persistent webOS activity `com.tbsniller.smarttwitchwebostv.boot`
    (created via `luna://com.webos.service.activitymanager/create`, callback
-   `com.webos.applicationManager/launch` of the wrapper - stock-public, so the
-   activity manager's rights check passes; the app's group membership lives in
-   `/var/luna-service2/client-permissions.d/com.tbsniller.smarttwitchwebostv.app.json`).
-   It fires on `bootManager core-boot-done` and launches the wrapper app.
-2. The wrapper's `index.js` kicks `org.webosbrew.hbchannel.service/autostart`
-   on every launch (fire-and-forget, idempotent per boot), which runs
-   `/var/lib/webosbrew/startup.sh` as root: dropbear (ssh) plus
-   `run-parts /var/lib/webosbrew/init.d` - our `99-sttv-serve` (source:
-   `webos/homebrew/99-sttv-serve`) starts the local remux server.
+   `com.webos.applicationManager/launch` of the wrapper with
+   `params: {sttv_boot_kick: 1}` — stock-public, so the activity manager's
+   rights check passes. Homebrew's `org.webosbrew.hbchannel.service/autostart`
+   **cannot** be an activity callback: `errorCode:13 "Activity creator doesn't
+   have rights to call its callback"`, tested. The app's group membership lives
+   in `/var/luna-service2/client-permissions.d/com.tbsniller.smarttwitchwebostv.app.json`.)
+   It fires on `bootManager core-boot-done`.
+2. The wrapper (`webos/app/index.js`) branches on the launch params:
+   - **`sttv_boot_kick` present** (boot activity): kick
+     `org.webosbrew.hbchannel.service/autostart` (runs
+     `/var/lib/webosbrew/startup.sh` as root: dropbear + telnetd +
+     `run-parts /var/lib/webosbrew/init.d`), then `applicationManager/close`
+     itself (sent twice,800ms apart). No navigation, no server, no SmartTwitch
+     left running — the wrapper window exists only for the moments of the kick.
+   - **normal manual launch**: kick + `ensureSttvServe()` + install the launch
+     handlers that navigate to the hosted app.
+3. **sttv_serve lifecycle — starts with the app, stops when it closes**
+   (source: `tools/tv-serve.js`):
+   - *start*: wrapper `ensureSttvServe()` on manual open and bridge bootstrap
+     (`hb exec`: `pgrep -f sttv_serve.js || nohup node sttv_serve.js 8099` —
+     idempotent). Never started by the boot chain; `99-sttv-serve` was removed
+     from `webos/homebrew/` and from the TV's `/var/lib/webosbrew/init.d/`.
+   - *stop*: bridge `pagehide`/`beforeunload` → `pkill -f sttv_serve.js`
+     (immediate when unload fires), **plus a heartbeat** as the reliable path:
+     the bridge pings `/health` every 10s while the page is alive and the
+     server exits after 90s without any request — so even a webOS process kill
+     (which does not reliably fire unload events) stops it within ~90s.
+   - *self-heal*: a failed heartbeat re-ensures the server (it may have
+     self-stopped while the page was suspended), and becoming visible again
+     re-ensures it too; active playback requests also keep it alive.
 
-Homebrew Channel was upgraded0.6.3 -> 0.7.3 on this TV (backup:
+Homebrew Channel was upgraded 0.6.3 -> 0.7.3 on this TV (backup:
 `/media/developer/hb_backup_063.tgz`); its service registers the same boot
 activity via `registerActivity` for its own startup.
 

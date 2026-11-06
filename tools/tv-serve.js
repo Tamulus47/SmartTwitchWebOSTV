@@ -119,6 +119,14 @@ function proxyPass(target, res, redirects) {
 var INIT_CACHE_MAX = 8;
 var TS_CACHE_MAX_ITEMS = 48;
 var TS_CACHE_MAX_BYTES = 64 * 1024 * 1024;
+// The server lives only while SmartTwitch is open (started by the wrapper /
+// bridge on app open, stopped on app close). The app page pings /health every
+// 10s while it is alive, so no request for STTV_SERVE_HEARTBEAT_EXIT_MS means
+// the app was closed or killed (webOS process kills do not reliably fire
+// unload hooks) - exit so nothing keeps running in the background. Active
+// playback refreshes lastReqMs through its normal requests as well.
+var STTV_SERVE_HEARTBEAT_EXIT_MS = 90 * 1000;
+var lastReqMs = Date.now();
 
 var initInfoCache = {}; // map url -> parsed init info
 var initInfoOrder = [];
@@ -1058,6 +1066,7 @@ function sendTs(res, buf) {
 function startServer() {
     http
         .createServer(function (req, res) {
+            lastReqMs = Date.now();
             var parsedReq = url.parse(req.url);
             var p = parsedReq.pathname;
             try {
@@ -1139,6 +1148,17 @@ function startServer() {
         })
         .listen(PORT, '0.0.0.0', function () {
             logLine('listening on ' + PORT);
+            // Heartbeat self-stop (see STTV_SERVE_HEARTBEAT_EXIT_MS).
+            setInterval(function () {
+                if (Date.now() - lastReqMs > STTV_SERVE_HEARTBEAT_EXIT_MS) {
+                    logLine(
+                        'heartbeat-timeout: no request for ' +
+                            STTV_SERVE_HEARTBEAT_EXIT_MS / 1000 +
+                            's (app closed?), exiting'
+                    );
+                    process.exit(0);
+                }
+            }, 15000);
         });
 }
 

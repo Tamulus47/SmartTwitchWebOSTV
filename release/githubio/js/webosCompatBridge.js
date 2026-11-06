@@ -3058,41 +3058,110 @@
 
     function startRemuxNative(probeUrl, gen, parsed) {
         var settled = false;
-        var finish = function (ok) {
+        var healthRetried = false;
+        function checkHealth() {
+            try {
+                var xhr = new XMLHttpRequest();
+                xhr.open('GET', REMUX_BASE + '/health', true);
+                xhr.timeout = 2500;
+                xhr.onload = function () {
+                    finish(xhr.status === 200 && String(xhr.responseText || '').indexOf('ok') !== -1);
+                };
+                xhr.onerror = function () {
+                    finish(false);
+                };
+                xhr.ontimeout = function () {
+                    finish(false);
+                };
+                xhr.send();
+            } catch (eRemux) {
+                finish(false);
+            }
+        }
+        function finish(ok) {
             if (settled) return;
-            settled = true;
-            w.clearTimeout(timer);
-            if (gen !== mainDetectGen) return; // superseded by a newer start
+            if (gen !== mainDetectGen) {
+                settled = true;
+                return; // superseded by a newer start
+            }
             if (ok) {
+                settled = true;
+                w.clearTimeout(timer);
                 bridgeDebugLog('remux_native_start', {url: String(probeUrl).substring(0, 90)});
                 attachNativeMainTo(remuxUrlFor(probeUrl));
                 return;
             }
+            if (!healthRetried) {
+                // The server only lives while the app is open and has an
+                // idle self-stop: kick it once and re-check before falling
+                // back to the (non-decoding) MSE path.
+                healthRetried = true;
+                w.clearTimeout(timer);
+                bridgeDebugLog('remux_server_down_retry', {});
+                ensureSttvServe();
+                timer = w.setTimeout(checkHealth, 3500);
+                return;
+            }
+            settled = true;
+            w.clearTimeout(timer);
             bridgeDebugLog('remux_server_down', {});
             if (ms.uri !== probeUrl) ms.uri = probeUrl; // align quality logic
             startMse(parsed, probeUrl, 0);
-        };
-        var timer = w.setTimeout(function () {
-            finish(false);
-        }, 2500);
+        }
+        var timer = w.setTimeout(checkHealth, 2500);
+    }
+
+    // --- sttv_serve lifecycle: start with the app page, stop on close ------
+    // The remux server is intentionally NOT part of the boot chain: it lives
+    // only while SmartTwitch is open - started by the wrapper on a manual
+    // app open, re-ensured here after page reloads, and stopped on page
+    // teardown (app close) so it never keeps running in the background.
+    var STTV_SERVE_START_CMD =
+        'pgrep -f sttv_serve.js >/dev/null || (cd /media/developer/sttv_stage && nohup node sttv_serve.js 8099 >/dev/null2>&1 &)';
+    var STTV_SERVE_STOP_CMD = 'pkill -f sttv_serve.js';
+    function sttvServeExec(command) {
+        try {
+            if (typeof w.PalmServiceBridge !== 'function') return false;
+            var b = new w.PalmServiceBridge();
+            b.onservicecallback = function () {};
+            b.call('luna://org.webosbrew.hbchannel.service/exec', JSON.stringify({command: command}));
+            return true;
+        } catch (e) {
+            bridgeDebugLog('sttv_serve_exec_error', {error: String(e)});
+            return false;
+        }
+    }
+    function ensureSttvServe() {
+        return sttvServeExec(STTV_SERVE_START_CMD);
+    }
+    function stopSttvServe() {
+        return sttvServeExec(STTV_SERVE_STOP_CMD);
+    }
+    // Heartbeat: while this app page is alive, ping /health every 10s. The
+    // server exits after ~90s without a ping, so closing/killing the app (webOS
+    // process kills do NOT reliably fire pagehide/beforeunload) stops it for
+    // sure; a failed ping means the server is already gone (idle self-stop or
+    // suspend) - restart it immediately so fMP4 playback never stays broken.
+    var sttvHeartbeatTimerId = 0; // -1 = app is closing, stay stopped
+    function sttvServeHeartbeat() {
+        if (sttvHeartbeatTimerId === -1) return;
         try {
             var xhr = new XMLHttpRequest();
             xhr.open('GET', REMUX_BASE + '/health', true);
-            xhr.timeout = 2500;
-            xhr.onload = function () {
-                finish(xhr.status === 200 && String(xhr.responseText || '').indexOf('ok') !== -1);
+            xhr.timeout = 3000;
+            var onFail = function () {
+                if (sttvHeartbeatTimerId === -1) return; // closing: do not restart
+                ensureSttvServe();
             };
-            xhr.onerror = function () {
-                finish(false);
-            };
-            xhr.ontimeout = function () {
-                finish(false);
-            };
+            xhr.onload = function () {};
+            xhr.onerror = onFail;
+            xhr.ontimeout = onFail;
             xhr.send();
-        } catch (eRemux) {
-            finish(false);
+        } catch (eHb) {
+            ensureSttvServe();
         }
     }
+    sttvHeartbeatTimerId = w.setInterval(sttvServeHeartbeat, 10000);
 
     // Starts main playback for ms.uri. Native HLS is attached immediately (no
     // added delay for MPEG-TS channels) while a parallel probe fetches the
@@ -6198,4 +6267,30 @@
     // 13) Pre-spawn the local HLS service so the first live/VOD playlist fetch
     // does not include the node cold-start inside its playback watchdog.
     w.setTimeout(warmUsherPlaylistService, 1000);
+    // 14) sttv_serve lifecycle: ensure the local remux server while this app
+    //     page lives, and stop it on page teardown (app close) so it does not
+    //     keep running in the background after SmartTwitch is closed.
+    //     - heartbeat ping every 10s (see sttvServeHeartbeat) lets the server
+    //       self-stop when the app is closed/killed even if unload hooks
+    //       never fire, and restarts it if it died while we were suspended;
+    //     - pagehide/beforeunload give the immediate stop when they do fire;
+    //     - becoming visible again re-ensures it (it may have self-stopped
+    //       while the page was hidden/suspended).
+    ensureSttvServe();
+    var stopSttvServeOnClose = function () {
+        if (sttvHeartbeatTimerId > 0) {
+            w.clearInterval(sttvHeartbeatTimerId);
+        }
+        sttvHeartbeatTimerId = -1; // block heartbeat restarts during teardown
+        stopSttvServe();
+    };
+    w.addEventListener('pagehide', stopSttvServeOnClose);
+    w.addEventListener('beforeunload', stopSttvServeOnClose);
+    w.document.addEventListener(
+        'visibilitychange',
+        function () {
+            if (!w.document.hidden && !w.document.webkitHidden) ensureSttvServe();
+        },
+        true
+    );
 })(window);

@@ -173,16 +173,14 @@
         launchHandlersInstalled = true;
     }
 
-    installLaunchHandlers();
-
-    // Kick the Homebrew Channel startup script on every wrapper launch. The
-    // boot-time launch is armed as a persistent webOS activity (callback =
-    // applicationManager/launch of this app), and startup.sh runs as root:
-    // it starts sshd (dropbear) and executes /var/lib/webosbrew/init.d hooks
-    // (the local fMP4->TS remux server). Fire-and-forget; the service call is
-    // delivered immediately and startup.sh is idempotent per boot (marker in
-    // /tmp), so repeated launches are no-ops. On non-rooted TVs PalmServiceBridge
-    // or the service is missing and this silently does nothing.
+    // Kick the Homebrew Channel startup script on every wrapper launch.
+    // startup.sh runs as root: it starts sshd (dropbear) + telnetd and runs
+    // run-parts /var/lib/webosbrew/init.d. Fire-and-forget; the service call
+    // is delivered immediately and startup.sh is idempotent per boot (marker
+    // in /tmp), so repeated launches are no-ops. On non-rooted TVs
+    // PalmServiceBridge or the service is missing and this silently does
+    // nothing. Note: sttv_serve is NOT part of this chain - it starts only
+    // with a manual app open (ensureSttvServe below) and stops on close.
     var homebrewKickBridge = null;
     function kickHomebrewStartup() {
         try {
@@ -198,5 +196,60 @@
             debugLog('homebrew_kick_error', {error: String(e)});
         }
     }
-    kickHomebrewStartup();
+    // sttv_serve (local fMP4->TS remux server) lifecycle: it must run ONLY
+    // while SmartTwitch is open - started here on a manual app open, stopped
+    // by the bridge's unload hook when the app closes, and never started by
+    // the boot chain.
+    var serveExecBridge = null;
+    function ensureSttvServe() {
+        try {
+            if (typeof global.PalmServiceBridge !== 'function') return;
+            serveExecBridge = new global.PalmServiceBridge();
+            serveExecBridge.onservicecallback = function () {};
+            serveExecBridge.call(
+                'luna://org.webosbrew.hbchannel.service/exec',
+                JSON.stringify({
+                    command:
+                        'pgrep -f sttv_serve.js >/dev/null || (cd /media/developer/sttv_stage && nohup node sttv_serve.js 8099 >/dev/null2>&1 &)'
+                })
+            );
+            debugLog('sttv_serve_ensure', {});
+        } catch (e) {
+            debugLog('sttv_serve_ensure_error', {error: String(e)});
+        }
+    }
+
+    // Close this placeholder window (boot kick path): SmartTwitch must not
+    // stay open at boot - it only exists to run the startup kick.
+    var selfCloseBridge = null;
+    function selfCloseApp() {
+        var doClose = function () {
+            try {
+                if (typeof global.PalmServiceBridge !== 'function') return;
+                selfCloseBridge = new global.PalmServiceBridge();
+                selfCloseBridge.onservicecallback = function () {};
+                selfCloseBridge.call(
+                    'luna://com.webos.applicationManager/close',
+                    JSON.stringify({id: 'com.tbsniller.smarttwitchwebostv'})
+                );
+            } catch (e) {}
+        };
+        doClose();
+        global.setTimeout(doClose, 800); // retry once if the first call raced
+        debugLog('boot_kick_self_close', {});
+    }
+
+    // Boot activity launch: only run the startup kick (ssh + telnet) and close
+    // this window immediately - no navigation, no app left running, no
+    // sttv_serve at boot.
+    var bootKickParams = parseLaunchParams(null);
+    if (bootKickParams && bootKickParams.sttv_boot_kick) {
+        debugLog('boot_kick_only', {});
+        kickHomebrewStartup();
+        selfCloseApp();
+    } else {
+        installLaunchHandlers();
+        kickHomebrewStartup();
+        ensureSttvServe();
+    }
 })(window);
