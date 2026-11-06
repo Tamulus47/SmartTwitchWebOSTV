@@ -814,8 +814,12 @@ function localVar(abs) {
     return '/hls/var.m3u8?u=' + encodeURIComponent(abs);
 }
 
-function localSeg(abs, mapAbs) {
-    return '/hls/seg.ts?u=' + encodeURIComponent(abs) + (mapAbs ? '&m=' + encodeURIComponent(mapAbs) : '');
+function localSeg(abs, mapAbs, n) {
+    // Unique PATH per segment (native Twitch playlists have distinct paths;
+    // uniform /hls/seg.ts?... paths may break the platform's sliding-window
+    // position<->segment mapping on live refreshes - appends get discarded
+    // and the playhead never reaches its data). n = media-sequence position.
+    return '/hls/seg/' + (n === undefined ? 'x' : n) + '.ts?u=' + encodeURIComponent(abs) + (mapAbs ? '&m=' + encodeURIComponent(mapAbs) : '');
 }
 
 // Playlist fetch with a last-good cache: during WiFi blips the previous
@@ -841,7 +845,7 @@ function playlistMeta(text) {
     var meta = { seq: null, pdt: null };
     var m = text.match(/#EXT-X-MEDIA-SEQUENCE:(\d+)/);
     if (m) meta.seq = parseInt(m[1], 10);
-    m = text.match(/#EXT-X-PROGRAM-DATE-TIME:([0-9:\-\+.Z]+)/);
+    m = text.match(/#EXT-X-PROGRAM-DATE-TIME:([0-9T:\-\+.Z]+)/);
     if (m) {
         var t = Date.parse(m[1]);
         if (!isNaN(t)) meta.pdt = t;
@@ -983,6 +987,9 @@ function hlsRewriteVariant(base, text, res) {
     }
     var out = [];
     var allIds = [];
+    var baseSeq = parseInt(seq, 10);
+    if (isNaN(baseSeq)) baseSeq = 0;
+    var segIdx = 0;
     for (i = 0; i < lines.length; i++) {
         var line = lines[i].replace(/\r$/, '');
         if (line.indexOf('#EXT-X-MAP:') === 0) continue; // TS is self-contained
@@ -996,7 +1003,8 @@ function hlsRewriteVariant(base, text, res) {
             lastSeg = segId(abs);
             allIds.push(segId(abs));
             segCount++;
-            out.push(/^https:\/\//.test(abs) ? localSeg(abs, mapAbs) : line);
+            out.push(/^https:\/\//.test(abs) ? localSeg(abs, mapAbs, baseSeq + segIdx) : line);
+            segIdx++;
         } else {
             out.push(line);
         }
@@ -1179,7 +1187,7 @@ function startServer() {
                 });
                 return;
             }
-            if (p === '/hls/seg.ts') {
+            if (p === '/hls/seg.ts' || p.indexOf('/hls/seg/') === 0) {
                 hlsSegment(qs, res);
                 return;
             }
