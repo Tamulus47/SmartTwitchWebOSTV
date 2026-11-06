@@ -1121,7 +1121,11 @@ function hlsSegment(qs, res) {
             var ts = null;
             var stats = {dropped: 0, total: 0, last: ''};
             try {
-                ts = muxSegment(info, segBuf, stats, qs.u ? String(qs.u) : '');
+                // Offset key must be a PER-STREAM constant: qs.u is the
+                // SEGMENT url (unique per line!) - keying by it would rebase
+                // every segment to ~0. qs.m (init/map URL) is constant for
+                // the variant's session - the correct key.
+                ts = muxSegment(info, segBuf, stats, qs.m ? String(qs.m) : qs.u ? String(qs.u) : '');
             } catch (e) {
                 logLine('hls mux err ' + e.message);
             }
