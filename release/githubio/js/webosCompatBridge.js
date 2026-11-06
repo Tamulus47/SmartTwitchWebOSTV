@@ -3015,6 +3015,70 @@
         try { mv.load(); } catch (eLoad) {}
     }
 
+    // Same as attachNativeMain but with an explicit URI (used for the local
+    // remux playlist so ms.rawUri/ms.uri keep pointing at the real stream).
+    function attachNativeMainTo(uri) {
+        if (!mv) return;
+        mv.src = uri;
+        applyMainLayout();
+        show(mv);
+        try { mv.load(); } catch (eLoad) {}
+    }
+
+    // --- fMP4 -> local TS remux -------------------------------------------
+    // webOS 3.4 (Chrome 38) cannot decode fMP4 in any path: MSE ingests it
+    // but emits zero samples / dies at init, and the platform HLS player
+    // demuxes it without ever producing a frame. MPEG-TS native HLS plays
+    // flawlessly, so the TV-local node server (tools/tv-serve.js, port 8099)
+    // transmuxes fMP4 segments to TS and serves a local HLS playlist that
+    // the platform player consumes like any TS channel. Chrome 38 allows the
+    // required mixed content (https page -> http://127.0.0.1) for both the
+    // health XHR and the media element. Falls back to the MSE path only when
+    // the local server is not running.
+    var REMUX_BASE = 'http://127.0.0.1:8099';
+
+    function remuxUrlFor(originalUrl) {
+        return REMUX_BASE + '/hls/master.m3u8?u=' + encodeURIComponent(originalUrl);
+    }
+
+    function startRemuxNative(probeUrl, gen, parsed) {
+        var settled = false;
+        var finish = function (ok) {
+            if (settled) return;
+            settled = true;
+            w.clearTimeout(timer);
+            if (gen !== mainDetectGen) return; // superseded by a newer start
+            if (ok) {
+                bridgeDebugLog('remux_native_start', {url: String(probeUrl).substring(0, 90)});
+                attachNativeMainTo(remuxUrlFor(probeUrl));
+                return;
+            }
+            bridgeDebugLog('remux_server_down', {});
+            if (ms.uri !== probeUrl) ms.uri = probeUrl; // align quality logic
+            startMse(parsed, probeUrl, 0);
+        };
+        var timer = w.setTimeout(function () {
+            finish(false);
+        }, 2500);
+        try {
+            var xhr = new XMLHttpRequest();
+            xhr.open('GET', REMUX_BASE + '/health', true);
+            xhr.timeout = 2500;
+            xhr.onload = function () {
+                finish(xhr.status === 200 && String(xhr.responseText || '').indexOf('ok') !== -1);
+            };
+            xhr.onerror = function () {
+                finish(false);
+            };
+            xhr.ontimeout = function () {
+                finish(false);
+            };
+            xhr.send();
+        } catch (eRemux) {
+            finish(false);
+        }
+    }
+
     // Starts main playback for ms.uri. Native HLS is attached immediately (no
     // added delay for MPEG-TS channels) while a parallel probe fetches the
     // media playlist; if it is fMP4 we swap to the MSE pump. Generation
@@ -3080,8 +3144,8 @@
                 if (parsed.initUri && parsed.segs.length && !parsed.byterange) {
                     mainStreamFormat = 'fmp4';
                     bridgeDebugLog('mse_probe_fmp4', {segs: parsed.segs.length, vod: !!parsed.endList});
-                    if (ms.uri !== probeUrl) ms.uri = probeUrl; // align quality logic with the MSE variant
-                    startMse(parsed, probeUrl, 0);
+                    if (ms.uri !== probeUrl) ms.uri = probeUrl; // align quality logic with the probed variant
+                    startRemuxNative(probeUrl, gen, parsed);
                 } else {
                     mainStreamFormat = 'ts';
                     bridgeDebugLog('mse_probe_ts', {segs: parsed.segs.length});

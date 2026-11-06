@@ -62,7 +62,8 @@ and are expected.
 - Analytics (`firebase`/`gtag`) may silently no-op on the TV; playback does not depend on them.
 - `checkForkVersionAndRefresh()` (bridge auto-update check) early-returns without `fetch`;
   the app still works, it just does not hot-reload on new upstream builds.
-- **fMP4 channels (~10-20% of live streams + their VODs) do not play** — see below.
+- **fMP4 channels (~10-20% of live streams + their VODs)** are fixed via the local TS remux
+  (requires the TV-local server, see below).
 
 ## Playback: playlist fetch (fixed)
 
@@ -83,53 +84,61 @@ in its service fallback that caused intermittent black screens:
 Verified live end-to-end: service_ok → master parsed → native attached → `readyState=4`,
 `currentTime` advancing, ABR ramping, chat rendering.
 
-## Playback: fMP4 channels (known limitation)
+## Playback: fMP4 channels (fixed via local TS remux)
 
-Channels on a **custom transcode stack** (`TRANSCODESTACK="Custom:1_Source_Max_1440p60..."`,
-~10-20% of streams, plus their VODs) serve **fMP4** segments (`#EXT-X-MAP`, `.mp4`) instead of
+Channels on a **custom transcode stack** (`TRANSCODESTACK="Custom:..."`, ~10-20% of streams,
+including Pisty, plus their VODs) serve **fMP4** segments (`#EXT-X-MAP`, `.mp4`) instead of
 MPEG-TS. No usher/token parameter changes the format — it is decided per transcode stack
-server-side. Chrome 38's native HLS demuxer cannot decode fMP4: the bytes buffer forever but
-`readyState` sticks at 1, `videoWidth=0`, eventually `MEDIA_ERR_DECODE`.
+server-side.
 
-An **MSE player** is implemented in the bridge and its plumbing is verified working:
-format probe via luna (`mse_probe_fmp4`/`mse_probe_ts`, master→variant resolution, quality cap
-480p for cold starts), `MediaSource.isTypeSupported('video/mp4; codecs="avc1..."'`) = true,
-init segment append + metadata (`videoWidth=852`), unknown-box sanitizer (Twitch `emsg` boxes),
-segment fetch via page XHR (live hosts `ACAO:*`) with `/sttv_proxy` fallback (VOD), and a
-control asset (Unified Streaming tears-of-steel fMP4) buffers with correct timing and no
-errors through the same pipeline.
+**Every fMP4 decode path on this TV is dead** (all verified on-device):
 
-What remains unresolved: **decode of the first buffered frame fails at runtime** and static
-analysis has eliminated every bitstream cause. Established from Chrome 38's actual source
-(`chromium/chromium @38.0.2125.122`, `media/formats/mp4/box_definitions.cc`,
-`track_run_iterator.cc`, `mp4_stream_parser.cc`):
+| Path | Behavior |
+| --- | --- |
+| Native HLS (`<video src=fmp4 playlist>`) | Demuxes (duration + buffered grow) but never decodes a frame: `videoWidth=0`, `readyState` stuck at 1 |
+| MSE (bridge player) | Ingests init + media but emits zero buffered samples / dies `MEDIA_ERR_SRC_NOT_SUPPORTED` right at the init append |
+| Progressive MP4 of the same codec (clips) | Works — the decoder itself is fine |
+| **MPEG-TS native HLS** | **Works flawlessly** (adaptive up to 1280x720) |
 
-- Chrome 38 uses the **legacy trun flag table** (`data-offset=0x1, first-sample-flags=0x4,
-  duration=0x100, size=0x200, flags=0x400`) and reads trun data as **per-sample rows**
-  `[dur][size][flags][cts]` — Twitch's truns (`0x301`/`0x701`) parse exactly correctly
-  under it (durations verified to sum to the `tfdt` deltas).
-- Sample data is read at `moof_queue_position + trun.data_offset` (moof-relative);
-  `tfhd` with an explicit `base-data-offset` is hard-rejected (`RCHECK(!(flags & 1))`),
-  which is why an explicit-base rewrite failed.
-- A faithful node port of these checks against the real VOD segments
-  (`tv_chrome38parse.js`) reports `ALL_CHECKS_PASS`, and a NAL walk at the exact
-  bytes Chrome 38 reads (`tv_nalwalk.js`) yields a perfect `SPS+PPS+IDR` frame.
-- `avcC` declares `Main@4.0` (`profile_indication=77`), `length_size=4` — matches the
-  declared `avc1.4D401F` mime; `isTypeSupported` = true.
+So the fix stops asking this browser to decode fMP4: the **TV-local node server
+(`tools/tv-serve.js`, port 8099) transmuxes fMP4 → MPEG-TS** — own ISO-BMFF parser + TS muxer
+written for ES5/node 0.12 (PAT/PMT with MPEG-2 CRC, per-PES PTS/DTS, PCR on video PES, ADTS
+headers built from `esds`, Annex-B NAL rewriting with in-band SPS/PPS before IDRs) — and serves
+a **local HLS playlist** (`/hls/master.m3u8?u=<original>`): variant URIs are rewritten to
+`/hls/var.m3u8?u=...`, media playlist URIs to `/hls/seg.ts?u=...&m=...` (the `EXT-X-MAP` is
+dropped, TS is self-contained; `EXTINF`/`MEDIA-SEQUENCE`/`PDT` tags are preserved verbatim).
+The platform player consumes the result exactly like a TS channel.
 
-So the container, offsets, codec config and NAL framing are all provably correct, yet the
-element fires `MEDIA_ERR_DECODE` ~170ms after the first media append (a standard control
-asset, tears-of-steel, never reaches `readyState 2` either — no MSE frame has ever decoded
-on this browser). Progressive MP4 playback of the same codec works on this device (clips),
-so the failure is specific to Chrome 38's **MSE-side demux/decode pipeline** on webOS and
-needs `chrome://media-internals` logs (blocked by the TV browser) to go further.
+Bridge integration (`startRemuxNative` in `webos/bridge/webosCompatBridge.js`): when the
+format probe reports fMP4, the bridge health-checks `http://127.0.0.1:8099/health` (2.5s
+timeout) and swaps the native `video.src` to the local remux playlist via
+`attachNativeMainTo`; if the server is unreachable it falls back to the previous MSE path.
+`ms.uri`/`ms.rawUri` keep pointing at the original Twitch URL, so quality selection
+(`SetQuality`) and `RestartPlayer` behave unchanged. Chrome 38 allows the mixed content this
+requires (https page → `http://127.0.0.1`): verified on the GitHub Pages origin — health XHR
+returns `200 ok`, the remux video plays (`readyState=4`, 852x480, `currentTime` advancing),
+and swapping `src` after a stalled native-fMP4 attach recovers cleanly.
 
-Implemented and verified while investigating: `timestampOffset` shift to a 0-based timeline
-(`mse_timestamp_offset` — buffered moves from `62.x` to `0.0`, aligning with EXTINF duration,
-resume seeks and the progress UI), a track-run overlap guard (`fixMseTrackOverlaps`,
-no-op on well-formed segments), and a format probe + MSE plumbing that is otherwise
-production-ready if the decode path is ever cracked.
+Server hardening learned during bring-up (all in `tools/tv-serve.js`): one automatic retry per
+upstream fetch (this TV's WiFi drops cause `ENETUNREACH`/timeouts that otherwise kill live
+playback), a last-good playlist cache answered instantly while a 1s background refresh keeps
+it current (the player's live-edge refresh loop never waits on upstream latency), tolerance
+for out-of-bounds samples (ad-inserted segments whose init does not match get skipped instead
+of failing the whole segment), LRU segment-TS cache, and timestamped request logging to
+`/tmp/httpd.log`.
+
+**Deployment**: copy `tools/tv-serve.js` to `/media/developer/sttv_stage/sttv_serve.js` and run
+`node sttv_serve.js 8099` (autostart via `/var/lib/webosbrew/startup.sh`). Without the server,
+fMP4 content fails fast (health check misses → MSE fallback → the existing error dialog).
+
+**Validation**: Pisty VOD `2919603413` transmuxes and plays continuously on the TV
+(`readyState=4`, `currentTime` 0→47s+, buffered 0→200s, no stalls). Because segment fetches
+now happen server-side, VOD playback no longer depends on `/sttv_proxy`, which does not exist
+on the GitHub Pages origin — that alone fixes the previous Pages-only VOD failure
+(`proxy_status_404` → "Player unable to play due to player error").
 
 Test harnesses for this investigation live in the session helpers (`expr_*.js` run through
 `cdp_eval_sttv.py`; offline validators `tv_chrome38parse.js`, `tv_nalwalk.js`,
-`tv_overlap.js`, `tv_boxes2.js`, `tv_init.js`, `tv_avcc.js` on the TV).
+`tv_overlap.js`, `tv_boxes2.js`, `tv_init.js`, `tv_avcc.js` on the TV; PC-side
+`test_remux.js` validates the transmuxed TS byte-for-byte — sync/PID/CC continuity, PAT/PMT
+CRC + program mapping, PES headers/lengths, DTS ordering, ADTS framing).
