@@ -1067,6 +1067,20 @@ function startServer() {
     http
         .createServer(function (req, res) {
             lastReqMs = Date.now();
+            // CORS on EVERY response: the hosted page (https origin) plays the
+            // media and may read frames back (canvas.drawImage + toDataURL for
+            // visual verification) - cross-origin media without ACAO taints the
+            // canvas. Guarded so explicit headers are not duplicated.
+            var origWriteHead = res.writeHead;
+            res.writeHead = function () {
+                try {
+                    var headers = arguments[arguments.length - 1];
+                    if (headers && typeof headers === 'object' && !headers['Access-Control-Allow-Origin']) {
+                        headers['Access-Control-Allow-Origin'] = '*';
+                    }
+                } catch (eHdr) {}
+                return origWriteHead.apply(res, arguments);
+            };
             var parsedReq = url.parse(req.url);
             var p = parsedReq.pathname;
             try {
