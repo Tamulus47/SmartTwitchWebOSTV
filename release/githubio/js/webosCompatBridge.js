@@ -2102,7 +2102,22 @@
     function sourceFromQuality(state, maxRes) {
         if (!state) return '';
         if (state.qp >= 0 && state.q[state.qp]) return state.q[state.qp].url;
-        if (state.rawUri && (!maxRes || maxRes <= 0)) return state.rawUri;
+        if (state.rawUri && (!maxRes || maxRes <= 0)) {
+            // Plan B: never hand the platform media stack a proxy-host master
+            // URL (as.luminous.dev / rte prefix proxies) - its native fetch of
+            // those hosts fails with MEDIA_ERR_SRC_NOT_SUPPORTED (error 4)
+            // while page XHR to them works fine. The proxied master body
+            // carries direct ttvnw variant URLs (verified: playlist.ttvnw.net
+            // variants over cloudfront.hls.ttvnw.net segments), so attach one
+            // of those instead and keep src inside the natively-playable
+            // ttvnw family. Falls back to rawUri when the body has no usable
+            // variant (same as the pre-Plan-B behavior).
+            if (isAdfreeProxyUrl(state.rawUri)) {
+                var adfreeVariant = pickFromMaster(state.rawUri, state.q, maxRes);
+                if (adfreeVariant && adfreeVariant !== state.rawUri) return adfreeVariant;
+            }
+            return state.rawUri;
+        }
         return pickFromMaster(state.rawUri, state.q, maxRes);
     }
     function normalizeQualityPosition(pos, listLength) {
@@ -2534,6 +2549,13 @@
             firstQuality: ms.q[0] && ms.q[0].id ? ms.q[0].id : ''
         });
         ms.uri = sourceFromQuality(ms, mainMaxRes);
+        // Plan B observability: show exactly what the native player will be
+        // handed (proxy rawUri vs a direct ttvnw variant picked from its body).
+        bridgeDebugLog('main_source_selected', {
+            uri: String(ms.uri || '').substring(0, 140),
+            proxyMaster: isAdfreeProxyUrl(ms.rawUri),
+            variantAttach: !!(isAdfreeProxyUrl(ms.rawUri) && ms.uri && ms.uri !== ms.rawUri)
+        });
         mainStreamFormat = null; // new stream: segment format unknown until probed
         startMainPlayback();
         // Align with Android PlayerActivity.onTracksChanged: refresh quality list
@@ -3082,6 +3104,16 @@
     // Attaches the native HLS source to the main video (MPEG-TS channels).
     function attachNativeMain() {
         if (!mv) return;
+        // Never inherit a stale CORS-mode flag left by the local remux path:
+        // ttvnw answers 403 to any request carrying a foreign Origin, so a
+        // native ttvnw variant attached with crossorigin=anonymous would fail
+        // the same way the proxy master did. Direct Twitch URLs stay no-cors
+        // (attachNativeMainTo sets the flag only for REMUX_BASE URLs).
+        try {
+            if (mv.crossOrigin && (!ms.uri || ms.uri.indexOf(REMUX_BASE) !== 0)) {
+                mv.crossOrigin = '';
+            }
+        } catch (eCo) {}
         mv.src = ms.uri;
         applyMainLayout();
         show(mv);
