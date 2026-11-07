@@ -247,6 +247,25 @@
     var USHER_PLAYLIST_CACHE_TTL_MS = 45000;           // In-memory TTL for service-fetched playlists.
     var USHER_PLAYLIST_CACHE_MAX = 24;                 // Max cached service playlist entries.
     var USHER_PLAYLIST_INFLIGHT_MAX_AGE_MS = 20000;    // Safety prune age for stale in-flight entries.
+    // --- Ad-free live proxy (ported from adamff-dev/twitch-adfree-webos, GPL-3.0) ---
+    // Live usher masters are fetched from public ad-free proxies first; the
+    // original request's query (token/sig/supported_codecs/...) is merged into
+    // the proxy URL so Twitch still authenticates the session. The proxy body
+    // replaces the direct master everywhere (quality list, format probe and -
+    // via responseUrl -> AutoUrl -> ms.rawUri - the native attach), so playback
+    // stays inside one URL family. No usable proxy body -> direct flow, unchanged.
+    // The $channel template is bare on purpose: our query already carries
+    // allow_source/fast_bread/supported_codecs=h264, and adding
+    // allow_audio_only (adfree's default) would inject a resolution-less
+    // audio_only variant that parseQ maps to a bogus "Auto" quality entry.
+    var ADFREE_PROXY_LUMINOUS_TEMPLATE = 'https://as.luminous.dev/live/$channel';
+    var ADFREE_PROXY_PREFIX_SERVERS = [                // URL-prefix proxies: the full original URL is appended.
+        'https://proxy4.rte.net.ru/',
+        'https://proxy7.rte.net.ru/',
+        'https://proxy5.rte.net.ru/',
+        'https://proxy6.rte.net.ru/'
+    ];
+    var ADFREE_PROXY_TIMEOUT_MS = 4000;                // Per-candidate XHR timeout; candidates run in parallel.
     var PREVIEW_SET_COOLDOWN_MS = 450;                 // Dedup cooldown for repeated setPrev calls.
     var LIFECYCLE_STOP_MIN_HIDDEN_MS = 12000;          // Min hidden time before stopping playback.
     var STALL_PROGRESS_THRESHOLD_MS = 4000;            // No-progress window before stall is considered persistent.
@@ -2685,6 +2704,45 @@
     // service — the only path that works: these hosts omit CORS headers for
     // our origin, and variant hosts reject the browser's Origin with 403.
     function fetchPlaylistText(url, timeoutMs, cb) {
+        // Ad-free proxy URLs (the live master when the proxy chain answered)
+        // send ACAO:* and were proven reachable from Chrome 38 TLS on the page
+        // origin; the luna service allowlists only *.m3u8 / *.playlist.ttvnw.net
+        // paths and would 403 them, so probe them with a page XHR directly.
+        if (isAdfreeProxyUrl(url)) {
+            var px = null;
+            var settled = false;
+            var finishProxy = function (err, text) {
+                if (settled) return;
+                settled = true;
+                if (px) {
+                    try {
+                        px.onreadystatechange = null;
+                        px.onerror = null;
+                        px.ontimeout = null;
+                    } catch (eCleanup) {}
+                }
+                cb(err, text);
+            };
+            try {
+                px = new XMLHttpRequest();
+                px.open('GET', url, true);
+                try {
+                    px.timeout = timeoutMs || MSE_PROBE_TIMEOUT_MS;
+                } catch (eTimeout) {}
+                px.onreadystatechange = function () {
+                    if (px.readyState !== 4) return;
+                    var text = px.responseText || '';
+                    if ((px.status || 0) === 200 && hasUsablePlaylistBody(text)) finishProxy(null, text);
+                    else finishProxy('proxy_status_' + (px.status || 0), '');
+                };
+                px.onerror = function () { finishProxy('proxy_net', ''); };
+                px.ontimeout = function () { finishProxy('proxy_timeout', ''); };
+                px.send(null);
+            } catch (eOpen) {
+                finishProxy('proxy_open', '');
+            }
+            return;
+        }
         var meta = buildNetworkRequestMeta(url, 'GET', '');
         callUsherPlaylistService(meta, timeoutMs || MSE_PROBE_TIMEOUT_MS, function (result, reason) {
             if (result && result.status === 200 && hasUsablePlaylistBody(result.responseText)) {
@@ -3937,6 +3995,182 @@
         if (rawUrl.indexOf('supported_codecs=') === -1) return rawUrl;
         return rawUrl.replace(/([?&]supported_codecs=)[^&]*/, '$1h264');
     }
+    // --- Ad-free live proxy (ported from twitch-adfree-webos patch_usher_xhr.js) ---
+    // Only live masters are proxied; VOD/clip playlists keep the direct flow.
+    function isLiveUsherPlaylistRequest(meta) {
+        if (!isUsherPlaylistRequest(meta)) return false;
+        return String(meta.pathLower || '').indexOf('/api/channel/hls/') === 0;
+    }
+    // Kill switch: ?sttv_adfree_proxy=0 or localStorage STTV_ADFREE_PROXY=0.
+    function adfreeProxyEnabled() {
+        try {
+            if (w.location && typeof w.location.search === 'string' && /(?:\?|&)sttv_adfree_proxy=0(?:&|$)/.test(w.location.search)) return false;
+        } catch (e0) {}
+        try {
+            if (w.localStorage && w.localStorage.getItem('STTV_ADFREE_PROXY') === '0') return false;
+        } catch (e1) {}
+        return true;
+    }
+    function isAdfreeProxyUrl(url) {
+        var s = String(url || '').toLowerCase();
+        if (s.indexOf('https://as.luminous.dev/') === 0) return true;
+        return s.indexOf('https://proxy') !== -1 && s.indexOf('.rte.net.ru/') !== -1;
+    }
+    function extractLiveChannelName(url) {
+        var m = String(url || '').match(/\/api\/channel\/hls\/([^\/?]+)\.m3u8/i);
+        return m && m[1] ? m[1] : '';
+    }
+    // ES5 port of twitch-adfree-webos mergeOriginalQuery: template params win,
+    // original params are carried only when the template does not set them
+    // (the token/signature live in the original query - the proxy must get them
+    // or Twitch rejects the request as unauthenticated).
+    function adfreeMergeOriginalQuery(target, originalUrl) {
+        var qAt = originalUrl.indexOf('?');
+        var originalQuery = qAt === -1 ? '' : originalUrl.slice(qAt + 1);
+        if (!originalQuery) return target;
+        var queryAt = target.indexOf('?');
+        var base = queryAt === -1 ? target : target.slice(0, queryAt);
+        var templateQuery = queryAt === -1 ? '' : target.slice(queryAt + 1);
+        var present = {};
+        var tps = templateQuery.split('&');
+        var ops = originalQuery.split('&');
+        var merged = [];
+        var i;
+        for (i = 0; i < tps.length; i++) {
+            if (tps[i]) {
+                present[tps[i].split('=')[0]] = 1;
+                merged.push(tps[i]);
+            }
+        }
+        for (i = 0; i < ops.length; i++) {
+            if (ops[i] && !present[ops[i].split('=')[0]]) merged.push(ops[i]);
+        }
+        return merged.length ? base + '?' + merged.join('&') : base;
+    }
+    // Candidate list: luminous first - it fetches the master from its own
+    // session (SUPPRESS=true upstream, no ad splice) and serves MPEG-TS
+    // variants that play natively on Chrome 38 (no remux needed) - then the
+    // generic URL-prefix proxies (pass-through from a different egress IP).
+    function buildAdfreeProxyCandidates(originalUrl) {
+        var list = [];
+        var channel = extractLiveChannelName(originalUrl);
+        if (channel) {
+            list.push({
+                tier: 'luminous',
+                url: adfreeMergeOriginalQuery(ADFREE_PROXY_LUMINOUS_TEMPLATE.split('$channel').join(channel), originalUrl)
+            });
+        }
+        var i;
+        for (i = 0; i < ADFREE_PROXY_PREFIX_SERVERS.length; i++) {
+            list.push({tier: 'prefix', url: ADFREE_PROXY_PREFIX_SERVERS[i] + originalUrl});
+        }
+        return list;
+    }
+    // Runs every candidate in parallel. Luminous wins as soon as it answers
+    // (ad-free guarantee); a prefix proxy only wins after luminous has failed.
+    // onDone(proxyResult|null) fires exactly once;
+    // proxyResult = {url: <proxy url>, text: <master body>, tier: <name>}.
+    function attemptAdfreeProxyChain(originalUrl, timeoutMs, onDone) {
+        var candidates = buildAdfreeProxyCandidates(originalUrl);
+        var done = false;
+        var settledCount = 0;
+        var luminousDone = false;
+        var luminousOk = null;
+        var prefixOk = null;
+        var xhrs = [];
+        var logReasons = [];
+        if (!candidates.length) {
+            onDone(null);
+            return;
+        }
+        var finishChain = function (result) {
+            if (done) return;
+            done = true;
+            var j;
+            for (j = 0; j < xhrs.length; j++) {
+                try {
+                    xhrs[j].onreadystatechange = null;
+                    xhrs[j].onerror = null;
+                    xhrs[j].ontimeout = null;
+                    if (xhrs[j].readyState !== 4) xhrs[j].abort();
+                } catch (eAbort) {}
+            }
+            if (!result) {
+                bridgeDebugLog('adfree_proxy_fallback', {
+                    reasons: logReasons.join(','),
+                    url: String(originalUrl || '').substring(0, 120)
+                });
+            }
+            onDone(result);
+        };
+        var consider = function () {
+            if (done) return;
+            if (luminousOk) {
+                finishChain(luminousOk);
+                return;
+            }
+            if (luminousDone && prefixOk) {
+                finishChain(prefixOk);
+                return;
+            }
+            if (settledCount === candidates.length) finishChain(null);
+        };
+        var runCandidate = function (cand, idx) {
+            var x = null;
+            var settled = false;
+            var markSettled = function () {
+                if (settled) return;
+                settled = true;
+                settledCount++;
+            };
+            var fail = function (reason) {
+                if (done) return;
+                markSettled();
+                logReasons.push(cand.tier + ':' + reason);
+                if (idx === 0) luminousDone = true;
+                consider();
+            };
+            try {
+                x = new XMLHttpRequest();
+                xhrs.push(x);
+                x.open('GET', cand.url, true);
+                try {
+                    x.timeout = timeoutMs;
+                } catch (eT) {}
+                x.onreadystatechange = function () {
+                    if (x.readyState !== 4 || settled || done) return;
+                    var status = x.status || 0;
+                    var text = x.responseText || '';
+                    if (status === 200 && hasUsablePlaylistBody(text) && text.indexOf('#EXT-X-STREAM-INF') !== -1) {
+                        markSettled();
+                        var result = {url: cand.url, text: text, tier: cand.tier};
+                        if (idx === 0) {
+                            luminousOk = result;
+                            luminousDone = true;
+                        } else if (!prefixOk) {
+                            prefixOk = result;
+                        }
+                        consider();
+                    } else {
+                        fail(status ? 'status' + status : 'status0');
+                    }
+                };
+                x.onerror = function () {
+                    fail('net');
+                };
+                x.ontimeout = function () {
+                    fail('timeout');
+                };
+                x.send(null);
+            } catch (eOpen) {
+                fail('open');
+            }
+        };
+        var i;
+        for (i = 0; i < candidates.length; i++) {
+            runCandidate(candidates[i], i);
+        }
+    }
     function shouldUseUsherPlaylistCorsFallback(meta, status, text, reason) {
         if (!isUsherPlaylistRequest(meta)) return false;
         var st = parseInt(status, 10) || 0;
@@ -4583,39 +4817,69 @@
             x = null;
             if (callbackRef) callbackRef(finalStatus, finalText, finalUrl);
         };
-        if (isUsherPlaylistRequest(meta) && (usherPlaylistCorsFailureSeen || forceServiceFetch)) {
-            if (forceServiceFetch) {
-                bridgeDebugLog('usher_hls_service_forced', {
-                    url: meta && meta.url ? meta.url : ''
-                });
+        // Existing direct flow (service/XHR), extracted so the ad-free proxy
+        // chain can run first and fall back to it untouched.
+        var startDirectFlow = function () {
+            if (isUsherPlaylistRequest(meta) && (usherPlaylistCorsFailureSeen || forceServiceFetch)) {
+                if (forceServiceFetch) {
+                    bridgeDebugLog('usher_hls_service_forced', {
+                        url: meta && meta.url ? meta.url : ''
+                    });
+                }
+                serviceAttempted = true;
+                attemptUsherService('service_fail');
+                return;
             }
-            serviceAttempted = true;
-            attemptUsherService('service_fail');
-            return;
-        }
-        if (meta.circuitEnabled && isCircuitOpenForHost(meta.host)) {
-            finish(0, '', 'circuit_open');
-            return;
-        }
-        if (meta.dedupeEnabled) abortInFlightRequestByKey(meta.requestKey);
-        try {
-            x = new XMLHttpRequest();
-            x.open(method, u, true);
+            if (meta.circuitEnabled && isCircuitOpenForHost(meta.host)) {
+                finish(0, '', 'circuit_open');
+                return;
+            }
+            if (meta.dedupeEnabled) abortInFlightRequestByKey(meta.requestKey);
             try {
-                x.timeout = effectiveTimeout;
-            } catch (e0) {}
-            setRequestHeaders(x, h);
-            if (meta.dedupeEnabled) registerInFlightRequest(meta.requestKey, x);
-            x.onreadystatechange = function () {
-                if (x.readyState === 4) finish(x.status || 0, x.responseText || '', (x.status || 0) > 0 ? 'success' : 'status0');
-            };
-            x.onerror = function () { finish(0, '', 'network_error'); };
-            x.ontimeout = function () { finish(0, '', 'timeout'); };
-            x.onabort = function () { finish(0, '', x && x.__sttvAbortReason === 'dedupe' ? 'dedupe_abort' : 'abort'); };
-            x.send(body ? body : null);
-        } catch (e1) {
-            finish(0, '', 'request_exception');
+                x = new XMLHttpRequest();
+                x.open(method, u, true);
+                try {
+                    x.timeout = effectiveTimeout;
+                } catch (e0) {}
+                setRequestHeaders(x, h);
+                if (meta.dedupeEnabled) registerInFlightRequest(meta.requestKey, x);
+                x.onreadystatechange = function () {
+                    if (x.readyState === 4) finish(x.status || 0, x.responseText || '', (x.status || 0) > 0 ? 'success' : 'status0');
+                };
+                x.onerror = function () { finish(0, '', 'network_error'); };
+                x.ontimeout = function () { finish(0, '', 'timeout'); };
+                x.onabort = function () { finish(0, '', x && x.__sttvAbortReason === 'dedupe' ? 'dedupe_abort' : 'abort'); };
+                x.send(body ? body : null);
+            } catch (e1) {
+                finish(0, '', 'request_exception');
+            }
+        };
+        // Ad-free live proxy first (luminous -> prefix proxies -> direct flow).
+        // responseUrl is the proxy URL that produced the body: the app stores it
+        // as AutoUrl and StartAuto attaches it natively (ms.rawUri), so the
+        // platform's own master fetch stays inside the same proxy family.
+        if (isLiveUsherPlaylistRequest(meta) && adfreeProxyEnabled() && !forceServiceFetch) {
+            attemptAdfreeProxyChain(u, ADFREE_PROXY_TIMEOUT_MS, function (proxyResult) {
+                if (done) return;
+                if (proxyResult) {
+                    bridgeDebugLog('adfree_proxy_success', {
+                        tier: proxyResult.tier,
+                        len: proxyResult.text.length,
+                        url: String(proxyResult.url).substring(0, 120)
+                    });
+                    // Mirror the service path's caching (synthetic finish skips
+                    // it): the sync stale-while-revalidate path and the service
+                    // fallback both read these caches by channel request key.
+                    cacheUsherPlaylistResult(meta.requestKey, proxyResult.text, proxyResult.url);
+                    cacheNetworkResponse(meta.requestKey, 200, proxyResult.text);
+                    finish(200, proxyResult.text, 'adfree_proxy_success', proxyResult.url, true, true);
+                } else {
+                    startDirectFlow();
+                }
+            });
+            return;
         }
+        startDirectFlow();
     }
     // Core XHR function. Supports both sync (mMethodUrlHeaders) and async modes.
     // Sync mode blocks the main thread — see network layer comment above for rationale.
@@ -4638,12 +4902,12 @@
                 return {status: cached.status, responseText: cached.responseText, checkResult: ck || 0};
             }
         }
-        if (sync && isUsherPlaylistRequest(meta) && (usherPlaylistCorsFailureSeen || forceServiceFetch)) {
-            if (forceServiceFetch) {
-                bridgeDebugLog('usher_hls_service_forced_sync', {
-                    url: meta && meta.url ? meta.url : ''
-                });
-            }
+        if (sync && isUsherPlaylistRequest(meta)) {
+            // Serve a fresh cached master (ad-free proxy or luna service fetch)
+            // even before the CORS-failure flag exists: a sync caller cannot
+            // recover from a doomed browser XHR on its own, and the proxy chain
+            // keeps the flag unset by succeeding. Cache miss with no flag still
+            // falls through to the direct sync XHR exactly as before.
             var cachedUsherPlaylist = getUsherPlaylistCacheEntry(meta.requestKey);
             if (cachedUsherPlaylist && hasUsablePlaylistBody(cachedUsherPlaylist.responseText || '')) {
                 return {
@@ -4653,8 +4917,15 @@
                     url: cachedUsherPlaylist.responseUrl || meta.url || ''
                 };
             }
-            requestUsherPlaylistViaService(meta, effectiveTimeout, function () {});
-            return buildUsherPlaylistCorsFallbackResult(meta, ck, 'service_deferred_sync');
+            if (usherPlaylistCorsFailureSeen || forceServiceFetch) {
+                if (forceServiceFetch) {
+                    bridgeDebugLog('usher_hls_service_forced_sync', {
+                        url: meta && meta.url ? meta.url : ''
+                    });
+                }
+                requestUsherPlaylistViaService(meta, effectiveTimeout, function () {});
+                return buildUsherPlaylistCorsFallbackResult(meta, ck, 'service_deferred_sync');
+            }
         }
         if (meta.circuitEnabled && isCircuitOpenForHost(meta.host)) {
             if (sync) {
