@@ -84,6 +84,47 @@ in its service fallback that caused intermittent black screens:
 Verified live end-to-end: service_ok → master parsed → native attached → `readyState=4`,
 `currentTime` advancing, ABR ramping, chat rendering.
 
+## Ad-free live proxy (ported from twitch-adfree-webos)
+
+Live masters (`usher.ttvnw.net/api/channel/hls/*.m3u8`) are fetched through the
+ad-free proxy chain ported from `adamff-dev/twitch-adfree-webos`
+(`src/scripts/patch_usher_xhr.js`): luminous bare template
+(`https://as.luminous.dev/live/<channel>`, original query params merged — template
+wins) → rte prefix proxies → direct request as the last tier. Only live masters are
+proxied; VOD/clip playlists keep the direct flow. Kill switches:
+`?sttv_adfree_proxy=0` or `localStorage STTV_ADFREE_PROXY=0`
+(`attemptAdfreeProxyChain` / `adfreeProxyEnabled` in `webos/bridge/webosCompatBridge.js`).
+
+**Plan A (attach the proxy master URL natively) is dead on this TV**: the platform
+media stack cannot fetch `as.luminous.dev`/rte hosts —
+`MEDIA_ERR_SRC_NOT_SUPPORTED` (error 4) — while page/service XHR to the same hosts
+works fine (the proxy chain itself always succeeded: `adfree_proxy_success`).
+
+**Plan B (shipped)**: `sourceFromQuality()` detects an ad-free proxy raw URI
+(`isAdfreeProxyUrl`) and, when no explicit quality pick or `SetMainPlayerBitrate`
+resolution cap applies, returns a variant URL picked from the proxied master body
+(`pickFromMaster`) instead of the proxy URL. The body still comes from the proxy, so
+the ad-free property is preserved, while the attach URL stays inside the
+natively-playable ttvnw family (`*.playlist.ttvnw.net` variants over
+`*.j.cloudfront.hls.ttvnw.net` segments — verified structurally identical to the
+direct master apart from signed URLs/edge nodes). Falls back to the raw proxy URI
+when the body has no usable variant (pre-Plan-B behavior). `attachNativeMain()`
+additionally clears a stale `crossorigin="anonymous"` left by the VOD remux path for
+non-REMUX URIs: ttvnw answers 403 to any foreign `Origin`, which would break the
+variant attach the same way (no canvas readback exists anywhere, so no-cors is safe).
+
+`main_source_selected` debug log records the chosen attach URI plus
+`proxyMaster`/`variantAttach` flags for observability.
+
+Verified on TV (2026-11-07): `adfree_proxy_success tier:luminous` →
+`main_playlist_parsed` → `main_source_selected ... proxyMaster:true
+variantAttach:true` → no `main_video_error`, live plays (`readyState=4`,
+`currentTime` advancing for minutes), `Android.SetQuality(1)` swaps to 720p and
+back to auto cleanly. Known non-blockers: the rte prefix tier currently 404s
+(fallback only), and `mse_probe_fail service_unavailable` only appears when the
+page runs outside the app wrapper (no `PalmSystem` → wrong `<id>.hls` service
+name); in the proper app context the probe succeeds (`mse_probe_ts segs:15`).
+
 ## Playback: fMP4 channels (fixed via local TS remux)
 
 Channels on a **custom transcode stack** (`TRANSCODESTACK="Custom:..."`, ~10-20% of streams,
@@ -139,6 +180,9 @@ the existing error dialog).
 now happen server-side, VOD playback no longer depends on `/sttv_proxy`, which does not exist
 on the GitHub Pages origin — that alone fixes the previous Pages-only VOD failure
 (`proxy_status_404` → "Player unable to play due to player error").
+Re-verified 2026-11-08 with the ad-free-proxy/Plan B bridge build (`3d7eaaf5a`): a Pisty
+fMP4 VOD plays through the remux (`video.src` on `http://127.0.0.1:8099/hls/master.m3u8`,
+`readyState=4`, no media error), so the Plan B edits did not regress the VOD/fMP4 path.
 
 Test harnesses for this investigation live in the session helpers (`expr_*.js` run through
 `cdp_eval_sttv.py`; offline validators `tv_chrome38parse.js`, `tv_nalwalk.js`,
