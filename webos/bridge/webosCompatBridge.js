@@ -115,6 +115,8 @@
     // body must never be silently bypassed (docs/Live_Playback_and_Adblock_Fixes.md, Fix B.2).
     var lastProxiedMasterBody = '';
     var lastProxiedMasterUrl = '';
+    var lastProxiedChannel = '';
+    var mainMaxBitrate = 0;    // Max bitrate cap for main player (0 = unlimited).
     // --- webOS 3.4 live quality ceiling (Fix B.1) ---
     // The 2016 SoC + flaky WiFi cannot sustain Twitch's 1080p60 live rung: a
     // 6-8 Mbps variant delivered in 2-second segments never refills the buffer,
@@ -284,7 +286,7 @@
         'https://proxy5.rte.net.ru/',
         'https://proxy6.rte.net.ru/'
     ];
-    var ADFREE_PROXY_TIMEOUT_MS = 4000;                // Per-candidate XHR timeout; candidates run in parallel.
+    var ADFREE_PROXY_TIMEOUT_MS = 6000;                // Per-candidate timeout; allows TV WiFi jitter.
     var PREVIEW_SET_COOLDOWN_MS = 450;                 // Dedup cooldown for repeated setPrev calls.
     var LIFECYCLE_STOP_MIN_HIDDEN_MS = 12000;          // Min hidden time before stopping playback.
     var STALL_PROGRESS_THRESHOLD_MS = 4000;            // No-progress window before stall is considered persistent.
@@ -1521,7 +1523,7 @@
         mv.addEventListener('timeupdate', function () {
             mainErrorCount = 0;
             var current = !isNaN(mv.currentTime) && isFinite(mv.currentTime) ? mv.currentTime : 0;
-            if (current > mainLastCurrentTime + 0.01) {
+            if (current > mainLastCurrentTime + 0.01 || current + 0.5 < mainLastCurrentTime) {
                 mainLastCurrentTime = current;
                 mainLastProgressWallMs = Date.now();
             }
@@ -1563,6 +1565,7 @@
             }
             if (mv.readyState >= 3) {
                 clearMainLoadingShowTimer();
+                if (!mv.paused && getBufferedAheadSeconds(mv) >= 2) return;
                 scheduleMainStallCheck();
                 return;
             }
@@ -1740,15 +1743,16 @@
             if (out.positionMs > out.durationMs) out.positionMs = out.durationMs;
             return out;
         }
+        var isLiveMain = video === mv && isLiveStreamState(ms);
         var rawDuration = parseFloat(video.duration);
-        if (isFinite(rawDuration) && rawDuration > 0) {
+        if (!isLiveMain && isFinite(rawDuration) && rawDuration > 0) {
             out.durationMs = Math.floor(rawDuration * 1000);
         }
         var currentSeconds = parseFloat(video.currentTime);
         if (isFinite(currentSeconds) && currentSeconds > 0) {
             out.positionMs = Math.floor(currentSeconds * 1000);
         }
-        if (out.durationMs <= 0) {
+        if (!isLiveMain && out.durationMs <= 0) {
             try {
                 if (video.seekable && video.seekable.length > 0) {
                     out.seekStartSeconds = parseFloat(video.seekable.start(0));
@@ -2157,11 +2161,15 @@
         if (!state) return '';
         if (state.qp >= 0 && state.q[state.qp]) return state.q[state.qp].url;
         var list = state.q;
-        // Plan B guard (Fix B.2): a missing parsed list must never leak a
-        // proxy-host URL to the native stack (its fetch of as.luminous.dev /
-        // rte prefix hosts fails with MEDIA_ERR_SRC_NOT_SUPPORTED). Re-parse
-        // the last proxied master body so a variant from it is always found.
-        if ((!list || !list.length) && lastProxiedMasterBody && isAdfreeProxyUrl(state.rawUri)) {
+        // Plan B guard (Fix B.2): a missing parsed list or a direct usher URL
+        // for the currently-proxied channel must never bypass the proxied
+        // master body (its fetch of as.luminous.dev / rte prefix hosts fails
+        // with MEDIA_ERR_SRC_NOT_SUPPORTED, and attaching direct usher leaks
+        // origin ads). Re-parse the last proxied master body when needed.
+        var reqCh = extractLiveChannelName(state.rawUri);
+        var sameProxiedChannel = !!(reqCh && lastProxiedChannel && reqCh.toLowerCase() === lastProxiedChannel && lastProxiedMasterBody);
+        var hasProxyMaster = isAdfreeProxyUrl(state.rawUri) || sameProxiedChannel;
+        if ((sameProxiedChannel || !list || !list.length) && lastProxiedMasterBody && hasProxyMaster) {
             list = parseQ(lastProxiedMasterBody, lastProxiedMasterUrl || state.rawUri);
         }
         // Live quality ceiling (Fix B.1): cap the single-variant pick at
@@ -2169,14 +2177,14 @@
         // attach path (native ABR) are untouched.
         var live = isLiveStreamState(state);
         var capRes = maxRes > 0 ? maxRes : 0;
-        var capBw = 0;
+        var capBw = state === ms && mainMaxBitrate > 0 ? mainMaxBitrate : 0;
         var preferLowFps = false;
         if (live) {
             if (!capRes || capRes > LIVE_MAX_HEIGHT) capRes = LIVE_MAX_HEIGHT;
-            capBw = LIVE_MAX_BANDWIDTH;
+            if (!capBw || capBw > LIVE_MAX_BANDWIDTH) capBw = LIVE_MAX_BANDWIDTH;
             preferLowFps = true;
         }
-        if (state.rawUri && (!maxRes || maxRes <= 0)) {
+        if (state.rawUri && (!maxRes || maxRes <= 0) && (!capBw || !hasProxyMaster)) {
             // Plan B: never hand the platform media stack a proxy-host master
             // URL (as.luminous.dev / rte prefix proxies) - its native fetch of
             // those hosts fails with MEDIA_ERR_SRC_NOT_SUPPORTED (error 4)
@@ -2186,7 +2194,7 @@
             // of those instead and keep src inside the natively-playable
             // ttvnw family. Falls back to rawUri when the body has no usable
             // variant (same as the pre-Plan-B behavior).
-            if (isAdfreeProxyUrl(state.rawUri)) {
+            if (hasProxyMaster) {
                 var adfreeVariant = pickFromMaster(state.rawUri, list, capRes, capBw, preferLowFps);
                 if (adfreeVariant && adfreeVariant !== state.rawUri) return adfreeVariant;
             }
@@ -2212,6 +2220,38 @@
         }
         return parsed;
     }
+    function filterLiveQualities(list) {
+        if (!list || !list.length) return [];
+        var supported = [];
+        var i;
+        for (i = 0; i < list.length; i++) {
+            var q = list[i];
+            if (!q || !q.url) continue;
+            if (!isCodecSetSupported(q.codecs)) continue;
+            supported.push(q);
+        }
+        if (!supported.length) supported = list.slice();
+        var withinCap = [];
+        for (i = 0; i < supported.length; i++) {
+            var c = supported[i];
+            if (c.resolution > LIVE_MAX_HEIGHT) continue;
+            if ((c.bandwidth || 0) > LIVE_MAX_BANDWIDTH) continue;
+            withinCap.push(c);
+        }
+        if (!withinCap.length) {
+            return [supported[supported.length - 1]];
+        }
+        var lowFps = [];
+        var hasDecentLowFps = false;
+        for (i = 0; i < withinCap.length; i++) {
+            var fps = withinCap[i].fps || 30;
+            if (fps <= 31) {
+                lowFps.push(withinCap[i]);
+                if (withinCap[i].resolution >= 360) hasDecentLowFps = true;
+            }
+        }
+        return hasDecentLowFps && lowFps.length ? lowFps : withinCap;
+    }
     function clearMainStallTimer() {
         if (!mainStallTimerId) return;
         w.clearTimeout(mainStallTimerId);
@@ -2234,6 +2274,10 @@
         mainLastBufferedAhead = 0;
         mainHardReloadCount = 0;
         mainLastHardReloadMs = 0;
+        sttvStallBestCt = 0;
+        sttvStallSince = 0;
+        sttvStallLastCt = -1;
+        sttvStallSeeks = 0;
     }
     function markMainProgressBaseline() {
         var now = Date.now();
@@ -2627,6 +2671,9 @@
         ms.rawUri = limitUsherCodecs(u || '');
         ms.playlist = pl || '';
         ms.q = parseQ(ms.playlist, ms.rawUri);
+        if (isLiveStreamState(ms) && ms.q.length > 0) {
+            ms.q = filterLiveQualities(ms.q);
+        }
         ms.qp = -1;
         ms.resume = rs > 0 ? rs : 0;
         bridgeDebugLog('main_playlist_parsed', {
@@ -2813,45 +2860,6 @@
     // service — the only path that works: these hosts omit CORS headers for
     // our origin, and variant hosts reject the browser's Origin with 403.
     function fetchPlaylistText(url, timeoutMs, cb) {
-        // Ad-free proxy URLs (the live master when the proxy chain answered)
-        // send ACAO:* and were proven reachable from Chrome 38 TLS on the page
-        // origin; the luna service allowlists only *.m3u8 / *.playlist.ttvnw.net
-        // paths and would 403 them, so probe them with a page XHR directly.
-        if (isAdfreeProxyUrl(url)) {
-            var px = null;
-            var settled = false;
-            var finishProxy = function (err, text) {
-                if (settled) return;
-                settled = true;
-                if (px) {
-                    try {
-                        px.onreadystatechange = null;
-                        px.onerror = null;
-                        px.ontimeout = null;
-                    } catch (eCleanup) {}
-                }
-                cb(err, text);
-            };
-            try {
-                px = new XMLHttpRequest();
-                px.open('GET', url, true);
-                try {
-                    px.timeout = timeoutMs || MSE_PROBE_TIMEOUT_MS;
-                } catch (eTimeout) {}
-                px.onreadystatechange = function () {
-                    if (px.readyState !== 4) return;
-                    var text = px.responseText || '';
-                    if ((px.status || 0) === 200 && hasUsablePlaylistBody(text)) finishProxy(null, text);
-                    else finishProxy('proxy_status_' + (px.status || 0), '');
-                };
-                px.onerror = function () { finishProxy('proxy_net', ''); };
-                px.ontimeout = function () { finishProxy('proxy_timeout', ''); };
-                px.send(null);
-            } catch (eOpen) {
-                finishProxy('proxy_open', '');
-            }
-            return;
-        }
         var meta = buildNetworkRequestMeta(url, 'GET', '');
         callUsherPlaylistService(meta, timeoutMs || MSE_PROBE_TIMEOUT_MS, function (result, reason) {
             if (result && result.status === 200 && hasUsablePlaylistBody(result.responseText)) {
@@ -3278,6 +3286,7 @@
             attachNativeMainTo(uri);
             return;
         }
+        var attachGen = mainDetectGen;
         var target = uri;
         var wrapped = remuxUrlFor(target);
         var settled = false;
@@ -3288,6 +3297,7 @@
             settled = true;
             w.clearTimeout(guardTimer);
             if (retryTimer) w.clearTimeout(retryTimer);
+            if (attachGen !== mainDetectGen) return;
             if (reason) {
                 bridgeDebugLog('live_serve_down', {reason: reason, fallback: 'direct'});
                 attachNativeMainTo(target);
@@ -3480,7 +3490,9 @@
             // backward seek movement must not reset the stall clock (otherwise
             // the gap-buster can cycle forever: seek -> one frame -> stall ->
             // seek ... which shows as frame-by-frame slideshow with no audio).
-            if (ct > sttvStallBestCt + 0.5) {
+            // However, if ct reset near 0 after a channel/quality swap, reset
+            // the high-water mark so the new session is not judged against the old.
+            if (ct > sttvStallBestCt + 0.5 || (ct < 5 && sttvStallBestCt > 10)) {
                 sttvStallBestCt = ct;
                 sttvStallSince = 0;
                 sttvStallLastCt = -1;
@@ -3545,6 +3557,13 @@
         var url = ms.uri;
         if (!url) return;
         stopMse(); // detach any previous MSE pipeline
+        if (isLiveStreamState(ms) && liveServeEnabled()) {
+            // Live streams routed through sttv_serve.js are served as Virtual-VOD
+            // MPEG-TS (handling both native TS and fMP4->TS transmux on 127.0.0.1:8099).
+            mainStreamFormat = 'ts';
+            attachNativeMain();
+            return;
+        }
         if (ms.type === 3 || mainStreamFormat === 'ts') {
             attachNativeMain(); // clips are direct MP4; TS is known-good here
             return;
@@ -4328,13 +4347,44 @@
         var runCandidate = function (cand, idx) {
             var x = null;
             var settled = false;
+            var serviceTried = false;
             var markSettled = function () {
                 if (settled) return;
                 settled = true;
                 settledCount++;
             };
+            var succeed = function (text) {
+                if (settled || done) return;
+                markSettled();
+                var result = {url: cand.url, text: text, tier: cand.tier};
+                if (idx === 0) {
+                    luminousOk = result;
+                    luminousDone = true;
+                } else if (!prefixOk) {
+                    prefixOk = result;
+                }
+                consider();
+            };
             var fail = function (reason) {
-                if (done) return;
+                if (settled || done) return;
+                // Luminous fallback via the packaged Luna HLS service (Fix A):
+                // if the browser XHR to as.luminous.dev fails or times out on
+                // flaky WiFi, let hls_service.js (8s timeout + 1 retry) try
+                // once before giving up on the ad-free master.
+                if (idx === 0 && !serviceTried && typeof w.PalmServiceBridge === 'function') {
+                    serviceTried = true;
+                    logReasons.push(cand.tier + ':xhr_' + reason);
+                    callUsherPlaylistService({url: cand.url}, timeoutMs, function (svcRes, svcReason) {
+                        if (settled || done) return;
+                        var svcText = svcRes && svcRes.responseText ? svcRes.responseText : '';
+                        if (svcRes && svcRes.status === 200 && hasUsablePlaylistBody(svcText) && svcText.indexOf('#EXT-X-STREAM-INF') !== -1) {
+                            succeed(svcText);
+                        } else {
+                            fail(svcReason || 'svc_fail');
+                        }
+                    });
+                    return;
+                }
                 markSettled();
                 logReasons.push(cand.tier + ':' + reason);
                 if (idx === 0) luminousDone = true;
@@ -4352,15 +4402,7 @@
                     var status = x.status || 0;
                     var text = x.responseText || '';
                     if (status === 200 && hasUsablePlaylistBody(text) && text.indexOf('#EXT-X-STREAM-INF') !== -1) {
-                        markSettled();
-                        var result = {url: cand.url, text: text, tier: cand.tier};
-                        if (idx === 0) {
-                            luminousOk = result;
-                            luminousDone = true;
-                        } else if (!prefixOk) {
-                            prefixOk = result;
-                        }
-                        consider();
+                        succeed(text);
                     } else {
                         fail(status ? 'status' + status : 'status0');
                     }
@@ -5081,6 +5123,7 @@
                     // always recover a Plan B variant list from it (Fix B.2).
                     lastProxiedMasterBody = proxyResult.text;
                     lastProxiedMasterUrl = String(proxyResult.url || '');
+                    lastProxiedChannel = extractLiveChannelName(u).toLowerCase();
                     // Mirror the service path's caching (synthetic finish skips
                     // it): the sync stale-while-revalidate path and the service
                     // fallback both read these caches by channel request key.
@@ -6148,7 +6191,7 @@
             ms.qp = normalizeQualityPosition(pos, ms.q.length);
             var tg = sourceFromQuality(ms, mainMaxRes);
             var currentSrc = (mv.currentSrc || mv.src || '');
-            var sameTarget = !!(tg && (tg === currentSrc || tg === mv.src));
+            var sameTarget = !!(tg && (tg === ms.uri || tg === currentSrc || tg === mv.src));
             if (!sameTarget && tg && isLiveStreamState(ms) && liveServeEnabled()) {
                 // Live attaches may be wrapped in the local sanitizer route
                 // (Fix C) - compare against the wrapped form too so a repeated
@@ -6164,11 +6207,11 @@
                 hasTarget: !!tg,
                 sameTarget: sameTarget
             });
-            if (!tg) return;
+            if (!tg || sameTarget) return;
+            resetMainRecoveryState();
             if (mseActive() || mainStreamFormat === 'fmp4') {
                 // MSE mode: the blob src never equals a playlist URL, so the
                 // target check compares against ms.uri (the active MSE variant).
-                if (tg === ms.uri) return;
                 ms.resume = ms.type === 2 ? mtime() : 0;
                 if (!isFinite(ms.resume)) ms.resume = 0;
                 ms.uri = tg;
@@ -6179,12 +6222,12 @@
             if (mainStreamFormat === 'ts') {
                 // Known MPEG-TS: direct native swap (the platform player handles
                 // it, no probe needed).
-                if (sameTarget) return;
                 ms.resume = ms.type === 2 || ms.type === 3 ? mtime() : 0;
                 if (!isFinite(ms.resume)) ms.resume = 0;
                 ms.uri = tg;
                 if (isLiveStreamState(ms) && liveServeEnabled() && tg.indexOf(REMUX_BASE) !== 0) {
                     // Live: keep the sanitizer route (Fix C) on quality swaps.
+                    ++mainDetectGen;
                     attachMainSrc(tg);
                 } else {
                     mv.src = tg;
@@ -6232,9 +6275,9 @@
             });
             return JSON.stringify(arr);
         };
-        // IMPLEMENTED: Sets max resolution cap for main player.
+        // IMPLEMENTED: Sets max resolution/bitrate cap for main player.
         A.SetMainPlayerBitrate = function (bitrate, resolution) {
-            void bitrate;
+            mainMaxBitrate = bitrate && bitrate > 0 ? parseInt(bitrate, 10) : 0;
             mainMaxRes = resolution && resolution > 0 ? parseInt(resolution, 10) + 10 : 0;
             if (ms.qp < 0 && ms.rawUri) A.SetQuality(-1);
         };

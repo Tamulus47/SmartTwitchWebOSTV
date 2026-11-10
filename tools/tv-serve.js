@@ -915,6 +915,7 @@ function rememberVariant(u, text) {
     if (idx >= 0) varCacheOrder.splice(idx, 1);
     varCacheOrder.push(u);
     while (varCacheOrder.length > 8) delete varCache[varCacheOrder.shift()];
+    feedLiveSession(u, text);
 }
 
 function refreshVariantAsync(u) {
@@ -1041,54 +1042,353 @@ function hlsMaster(qs, res) {
     }, staticMode);
 }
 
-function hlsRewriteVariant(base, text, res) {
+var liveSessionsById = {};
+var liveSessionsByBase = {};
+var liveSessionOrder = [];
+var liveSessionSeq = 0;
+var LIVE_VIRTUAL_VOD_SEGMENTS = 1800; // 1 hour @ 2s/segment
+var LIVE_INITIAL_SEED_SEGMENTS = 6; // 12s immediately available buffer
+
+function parseLiveVariantItems(base, text) {
     var lines = text.split('\n');
     var mapAbs = '';
+    var seq = 0;
+    var isVod = false;
+    var encrypted = false;
     var i;
-    var seq = '?';
-    var firstSeg = '';
-    var lastSeg = '';
-    var segCount = 0;
     for (i = 0; i < lines.length; i++) {
-        if (lines[i].indexOf('#EXT-X-MEDIA-SEQUENCE:') === 0) seq = lines[i].substring(22);
-        if (lines[i].indexOf('#EXT-X-MAP:') === 0) {
-            var mm = lines[i].match(/URI="([^"]+)"/);
+        var l0 = lines[i].replace(/\r$/, '');
+        if (l0.indexOf('#EXT-X-MEDIA-SEQUENCE:') === 0) {
+            var parsedSeq = parseInt(l0.substring(22), 10);
+            if (!isNaN(parsedSeq)) seq = parsedSeq;
+        }
+        if (l0.indexOf('#EXT-X-ENDLIST') === 0) isVod = true;
+        if (l0.indexOf('#EXT-X-MAP:') === 0) {
+            var mm = l0.match(/URI="([^"]+)"/);
             if (mm) mapAbs = url.resolve(base, mm[1]);
-        } else if (lines[i].indexOf('#EXT-X-KEY:') === 0 && lines[i].indexOf('METHOD=AES') !== -1) {
-            sendErr(res, 502, 'encrypted playlist not supported');
-            return;
+        } else if (l0.indexOf('#EXT-X-KEY:') === 0 && l0.indexOf('METHOD=AES') !== -1) {
+            encrypted = true;
         }
     }
-    var out = [];
+    var items = [];
+    var segIdx = 0;
+    var skipAd = false;
+    var adStripped = 0;
+    var curDur = 2.0;
+    for (i = 0; i < lines.length; i++) {
+        var line = lines[i].replace(/\r$/, '');
+        if (line.indexOf('#EXT-X-TWITCH-PREFETCH:') === 0) continue;
+        if (
+            line.indexOf('#EXT-X-DATERANGE:') === 0 &&
+            (line.indexOf('stitched-ad') !== -1 ||
+                line.indexOf('twitch-stitched-ad') !== -1 ||
+                line.indexOf('twitch-ad-quartile') !== -1 ||
+                line.indexOf('X-TV-TWITCH-AD') !== -1 ||
+                line.indexOf('Amazon') !== -1)
+        ) {
+            continue;
+        }
+        var isUri = line.length > 0 && line.charAt(0) !== '#';
+        if (skipAd) {
+            if (isUri) {
+                skipAd = false;
+                adStripped++;
+                segIdx++;
+            }
+            continue;
+        }
+        if (isUri) {
+            var abs = url.resolve(base, line);
+            var pos = seq + segIdx;
+            segIdx++;
+            if (/^https:\/\//.test(abs)) {
+                items.push({
+                    pos: pos,
+                    id: segId(abs),
+                    segUrl: abs,
+                    mapUrl: mapAbs,
+                    dur: curDur
+                });
+            }
+            curDur = 2.0;
+            continue;
+        }
+        if (line.indexOf('#EXTINF:') === 0) {
+            if (line.indexOf(',live') === -1 && (line.indexOf('Amazon') !== -1 || line.indexOf('stitched-ad') !== -1)) {
+                skipAd = true;
+                continue;
+            }
+            var dm = line.match(/^#EXTINF:([0-9.]+)/);
+            if (dm) {
+                var d = parseFloat(dm[1]);
+                if (isFinite(d) && d > 0) curDur = d;
+            }
+        }
+    }
+    return {
+        isVod: isVod,
+        encrypted: encrypted,
+        seq: seq,
+        mapAbs: mapAbs,
+        items: items,
+        adStripped: adStripped
+    };
+}
+
+function prefetchLiveItem(item) {
+    if (!item || !item.segUrl) return;
+    if (tsCacheGet(item.segUrl)) return;
+    if (!item.mapUrl) {
+        fetchBuf(item.segUrl, function (err, buf) {
+            if (!err && buf) tsCachePut(item.segUrl, buf);
+        });
+    } else {
+        getInitInfo(item.mapUrl, function (err, info) {
+            if (err || !info) return;
+            fetchBuf(item.segUrl, function (err2, segBuf) {
+                if (err2 || !segBuf) return;
+                try {
+                    var stats = {dropped: 0, total: 0, last: ''};
+                    var ts = muxSegment(info, segBuf, stats, item.mapUrl);
+                    if (ts) tsCachePut(item.segUrl, ts);
+                } catch (e) {}
+            });
+        });
+    }
+}
+
+function notifyLiveSessionWaiters(sess) {
+    if (!sess || !sess.waiters || !sess.waiters.length) return;
+    var remaining = [];
+    var i;
+    for (i = 0; i < sess.waiters.length; i++) {
+        var w = sess.waiters[i];
+        if (w.done) continue;
+        if (w.idx < sess.queue.length) {
+            w.done = true;
+            clearTimeout(w.timer);
+            w.cb(null, sess.queue[w.idx]);
+        } else {
+            remaining.push(w);
+        }
+    }
+    sess.waiters = remaining;
+}
+
+function feedLiveSession(base, text) {
+    var sess = liveSessionsByBase[base];
+    if (!sess) return;
+    var parsed = parseLiveVariantItems(base, text);
+    if (parsed.isVod || !parsed.items.length) return;
+    var added = 0;
+    var i;
+    for (i = 0; i < parsed.items.length; i++) {
+        var cand = parsed.items[i];
+        if (!sess.seenIds[cand.id] && (cand.pos > sess.lastPos || sess.lastPos - cand.pos > 1000)) {
+            sess.queue.push(cand);
+            sess.seenIds[cand.id] = true;
+            sess.lastPos = cand.pos;
+            added++;
+            if (sess.queue.length - 1 <= sess.maxReqIdx + 2) {
+                prefetchLiveItem(cand);
+            }
+        }
+    }
+    if (added > 0) {
+        sess.updatedAt = Date.now();
+        notifyLiveSessionWaiters(sess);
+    }
+}
+
+function getOrCreateLiveSession(base, parsed) {
+    var nowMs = Date.now();
+    var existing = liveSessionsByBase[base];
+    if (existing && nowMs - existing.createdAt < 4000 && existing.maxReqIdx <= 0 && existing.queue.length > 0) {
+        return existing;
+    }
+    var items = parsed.items;
+    var startIdx = Math.max(0, items.length - LIVE_INITIAL_SEED_SEGMENTS);
+    var seed = items.slice(startIdx);
+    var sessId = String(++liveSessionSeq);
+    var segDur = seed.length > 0 && seed[0].dur > 0 ? seed[0].dur : 2.0;
+    var sess = {
+        id: sessId,
+        base: base,
+        createdAt: nowMs,
+        updatedAt: nowMs,
+        lastReqAt: nowMs,
+        lastPos: -1,
+        maxReqIdx: -1,
+        segDur: segDur,
+        seenIds: {},
+        queue: [],
+        waiters: []
+    };
+    var i;
+    for (i = 0; i < seed.length; i++) {
+        sess.queue.push(seed[i]);
+        sess.seenIds[seed[i].id] = true;
+        sess.lastPos = seed[i].pos;
+    }
+    liveSessionsByBase[base] = sess;
+    liveSessionsById[sessId] = sess;
+    liveSessionOrder.push(sessId);
+    while (liveSessionOrder.length > 8) {
+        var oldId = liveSessionOrder.shift();
+        var oldSess = liveSessionsById[oldId];
+        if (oldSess) {
+            if (liveSessionsByBase[oldSess.base] === oldSess) {
+                delete liveSessionsByBase[oldSess.base];
+            }
+            delete liveSessionsById[oldId];
+        }
+    }
+    if (sess.queue[0]) prefetchLiveItem(sess.queue[0]);
+    if (sess.queue[1]) prefetchLiveItem(sess.queue[1]);
+    return sess;
+}
+
+function buildLiveVirtualVodPlaylist(sess) {
+    var durNum = sess.segDur > 0 ? sess.segDur : 2.0;
+    var targetDur = Math.max(2, Math.ceil(durNum));
+    var durStr = durNum.toFixed(3);
+    var out = [
+        '#EXTM3U',
+        '#EXT-X-VERSION:3',
+        '#EXT-X-TARGETDURATION:' + targetDur,
+        '#EXT-X-MEDIA-SEQUENCE:0'
+    ];
+    var i;
+    for (i = 0; i < LIVE_VIRTUAL_VOD_SEGMENTS; i++) {
+        out.push('#EXTINF:' + durStr + ',live');
+        out.push('/hls/lseg/' + i + '.ts?s=' + sess.id);
+    }
+    out.push('#EXT-X-ENDLIST');
+    return out.join('\n');
+}
+
+function hlsLiveSegment(p, qs, req, res) {
+    var sessId = qs.s ? String(qs.s) : '';
+    var sess = liveSessionsById[sessId];
+    if (!sess) {
+        sendErr(res, 404, 'live session not found');
+        return;
+    }
+    var m = p.match(/\/hls\/lseg\/(\d+)\.ts/);
+    var idx = m ? parseInt(m[1], 10) : parseInt(String(qs.i || '-1'), 10);
+    if (isNaN(idx) || idx < 0) {
+        sendErr(res, 400, 'bad segment index');
+        return;
+    }
+    sess.lastReqAt = Date.now();
+    if (idx > sess.maxReqIdx) sess.maxReqIdx = idx;
+    ensureVariantTimer(sess.base);
+
+    function serveItem(item) {
+        if (sess.queue[idx + 1]) prefetchLiveItem(sess.queue[idx + 1]);
+        hlsSegment({u: item.segUrl, m: item.mapUrl || ''}, res);
+    }
+
+    if (idx < sess.queue.length) {
+        serveItem(sess.queue[idx]);
+        return;
+    }
+
+    // The player's read-ahead buffer has reached the live edge; wait for the
+    // 1s upstream variant poller to append segment `idx` to sess.queue.
+    refreshVariantAsync(sess.base);
+    var waiter = {
+        idx: idx,
+        done: false,
+        timer: null,
+        cb: function (err, item) {
+            if (err || !item) {
+                sendErr(res, 504, 'live segment timeout');
+                return;
+            }
+            serveItem(item);
+        }
+    };
+    waiter.timer = setTimeout(function () {
+        if (waiter.done) return;
+        waiter.done = true;
+        // Fallback: if upstream froze briefly, repeat the most recent segment
+        // rather than failing the HTTP request and killing the player.
+        if (sess.queue.length > 0) {
+            var fallback = sess.queue[sess.queue.length - 1];
+            logLine('lseg fallback idx=' + idx + ' qlen=' + sess.queue.length);
+            serveItem(fallback);
+        } else {
+            waiter.cb(new Error('timeout'));
+        }
+    }, 8000);
+    res.on('close', function () {
+        if (!waiter.done) {
+            waiter.done = true;
+            clearTimeout(waiter.timer);
+        }
+    });
+    sess.waiters.push(waiter);
+}
+
+function hlsRewriteVariant(base, text, res) {
+    var parsed = parseLiveVariantItems(base, text);
+    if (parsed.encrypted) {
+        sendErr(res, 502, 'encrypted playlist not supported');
+        return;
+    }
+    if (!parsed.isVod && parsed.items.length > 0) {
+        ensureVariantTimer(base);
+        var sess = getOrCreateLiveSession(base, parsed);
+        feedLiveSession(base, text);
+        var seedIds = [];
+        for (var si = 0; si < sess.queue.length; si++) seedIds.push(sess.queue[si].id);
+        logLine(
+            'varserve virtual-vod sess=' +
+                sess.id +
+                ' seed=' +
+                sess.queue.length +
+                ' adStripped=' +
+                parsed.adStripped +
+                ' ids=' +
+                seedIds.join(',')
+        );
+        sendText(res, buildLiveVirtualVodPlaylist(sess));
+        return;
+    }
+    var lines = text.split('\n');
+    var mapAbs = parsed.mapAbs;
+    var i;
+    var seq = String(parsed.seq);
+    var segCount = 0;
+    var hdr = [];
+    var segEntries = [];
+    var curTags = [];
     var allIds = [];
-    var baseSeq = parseInt(seq, 10);
-    if (isNaN(baseSeq)) baseSeq = 0;
+    var baseSeq = parsed.seq;
     var segIdx = 0;
     var skipAdSegment = false;
     var adStripped = 0;
     for (i = 0; i < lines.length; i++) {
         var line = lines[i].replace(/\r$/, '');
-        // Fix C (docs/Live_Playback_and_Adblock_Fixes.md): strip low-latency
-        // prefetch pointers - the webOS 3.4 HLS demuxer mishandles them and
-        // starves at a 1-frame live edge.
         if (line.indexOf('#EXT-X-TWITCH-PREFETCH:') === 0) continue;
-        // Fix C: strip Twitch SSAI mid-roll markers so the ad window is no
-        // longer announced to the platform player.
-        if (line.indexOf('#EXT-X-DATERANGE:') === 0 &&
+        if (
+            line.indexOf('#EXT-X-DATERANGE:') === 0 &&
             (line.indexOf('stitched-ad') !== -1 ||
-             line.indexOf('twitch-stitched-ad') !== -1 ||
-             line.indexOf('Amazon') !== -1)) {
+                line.indexOf('twitch-stitched-ad') !== -1 ||
+                line.indexOf('twitch-ad-quartile') !== -1 ||
+                line.indexOf('X-TV-TWITCH-AD') !== -1 ||
+                line.indexOf('Amazon') !== -1)
+        ) {
             continue;
         }
         var isUriLine = line.length > 0 && line.charAt(0) !== '#';
         if (skipAdSegment) {
-            // Consume the ad segment URI (the intervening #EXT-X-DISCONTINUITY
-            // and tags go with it); keep counting it so media-sequence based
-            // segment paths stay stable across playlist refreshes.
             if (isUriLine) {
                 skipAdSegment = false;
                 adStripped++;
                 segIdx++;
+                curTags = [];
             }
             continue;
         }
@@ -1096,22 +1396,49 @@ function hlsRewriteVariant(base, text, res) {
             var abs = url.resolve(base, line);
             var segPos = baseSeq + segIdx;
             segIdx++;
-            if (!firstSeg) firstSeg = segId(abs);
-            lastSeg = segId(abs);
-            allIds.push(segId(abs));
-            segCount++;
-            out.push(/^https:\/\//.test(abs) ? localSeg(abs, mapAbs, segPos) : line);
+            segEntries.push({
+                pos: segPos,
+                id: segId(abs),
+                tags: curTags,
+                uri: /^https:\/\//.test(abs) ? localSeg(abs, mapAbs, segPos) : line
+            });
+            curTags = [];
             continue;
         }
-        // Fix C: skip ad-stitched segments (#EXTINF:2.000,Amazon|... etc).
-        if (line.indexOf('#EXTINF:') === 0 &&
+        if (
+            line.indexOf('#EXTINF:') === 0 &&
             line.indexOf(',live') === -1 &&
-            (line.indexOf('Amazon') !== -1 || line.indexOf('stitched-ad') !== -1)) {
+            (line.indexOf('Amazon') !== -1 || line.indexOf('stitched-ad') !== -1)
+        ) {
             skipAdSegment = true;
+            curTags = [];
             continue;
         }
         if (line.indexOf('#EXT-X-MAP:') === 0) continue; // TS is self-contained
-        out.push(line);
+        if (
+            line.indexOf('#EXT-X-DATERANGE:') === 0 ||
+            line.indexOf('#EXT-X-TWITCH-') === 0 ||
+            line.indexOf('#EXT-X-PROGRAM-DATE-TIME:') === 0
+        ) {
+            continue;
+        }
+        if (
+            line.indexOf('#EXTINF:') === 0 ||
+            line.indexOf('#EXT-X-DISCONTINUITY') === 0 ||
+            line.indexOf('#EXT-X-BYTERANGE:') === 0
+        ) {
+            curTags.push(line);
+        } else {
+            hdr.push(line);
+        }
+    }
+    var out = hdr.slice();
+    for (i = 0; i < segEntries.length; i++) {
+        var se = segEntries[i];
+        allIds.push(se.id);
+        segCount++;
+        for (var ti = 0; ti < se.tags.length; ti++) out.push(se.tags[ti]);
+        out.push(se.uri);
     }
     logLine('varserve seq=' + seq + ' n=' + segCount + ' adStripped=' + adStripped + ' ids=' + allIds.join(','));
     sendText(res, out.join('\n'));
@@ -1168,6 +1495,210 @@ function tsCachePut(k, v) {
     }
 }
 
+// --- MPEG-TS passthrough timestamp rebase (live TS channels) ---------------
+// Twitch live TS timestamps count from the broadcast start, so after ~3.3h
+// of uptime every PTS/DTS/PCR exceeds 2^30 ticks. On webOS 3.4 the platform
+// player wedges on such streams exactly like the fMP4 case above (see
+// getOffset90k): it renders one frame, pins currentTime at buffered-end+1
+// and stops accepting new data while the loader keeps downloading - the
+// "frame -> spinner -> frame" symptom. Verified on-device 2026-11-10 with a
+// 5.3h-old stream (raw PTS 1.71e9). VODs and young streams stay below the
+// limit, which is why they always played and live only "sometimes" did.
+//
+// Fix: rewrite PTS/DTS (PES headers) and PCR (adaptation field) of every TS
+// packet with ONE constant offset per broadcast timeline so the emitted
+// values start ~600s (54e6 ticks) above zero. The offset is shared by every
+// variant of the same broadcast (Twitch renditions share one timeline), so
+// native ABR switches stay continuous; a raw timestamp far from the last one
+// seen (other channel / new session) re-keys it. Raw bytes stay cached; each
+// response gets a rebased copy. Kill switch: touch /tmp/sttv_no_ts_rebase.
+var TS_REBASE_THRESHOLD = 1073741824; // 2^30 ticks (~3.31h): rebase only above this
+var TS_REBASE_HEADROOM = 54000000; // 600s of backfill headroom (90kHz)
+var TS_REBASE_REKEY_GAP = 54000000; // >10min jump = different timeline
+var TS_33BIT = 8589934592; // 2^33 PTS/PCR wrap
+var tsPassState = null;
+
+function tsRebaseDisabled() {
+    try {
+        return fs.existsSync('/tmp/sttv_no_ts_rebase');
+    } catch (e) {
+        return false;
+    }
+}
+
+function readPts33(b, q) {
+    return (
+        ((b[q] >> 1) & 7) * 1073741824 +
+        b[q + 1] * 4194304 +
+        (b[q + 2] >> 1) * 32768 +
+        b[q + 3] * 128 +
+        (b[q + 4] >> 1)
+    );
+}
+
+function writePts33(b, q, v) {
+    // Arithmetic only: v can exceed 2^31, where JS bitwise ops break.
+    b[q] = (b[q] & 0xf0) | ((Math.floor(v / 1073741824) & 7) << 1) | 1;
+    b[q + 1] = Math.floor(v / 4194304) & 0xff;
+    b[q + 2] = ((Math.floor(v / 32768) & 0x7f) << 1) | 1;
+    b[q + 3] = Math.floor(v / 128) & 0xff;
+    b[q + 4] = ((v % 128) << 1) | 1;
+}
+
+function readPcrBase(b, q) {
+    return b[q] * 33554432 + b[q + 1] * 131072 + b[q + 2] * 512 + b[q + 3] * 2 + (b[q + 4] >> 7);
+}
+
+function writePcrBase(b, q, v) {
+    b[q] = Math.floor(v / 33554432) & 0xff;
+    b[q + 1] = Math.floor(v / 131072) & 0xff;
+    b[q + 2] = Math.floor(v / 512) & 0xff;
+    b[q + 3] = Math.floor(v / 2) & 0xff;
+    b[q + 4] = ((v % 2) << 7) | (b[q + 4] & 0x7f); // keep reserved + ext bit
+}
+
+// Walks TS packets; calls onPts(buf, offset) for each PES PTS/DTS field and
+// onPcr(buf, offset) for each PCR. Returns false on lost sync.
+function walkTsTimestamps(b, onPts, onPcr) {
+    var o;
+    for (o = 0; o + 188 <= b.length; o += 188) {
+        if (b[o] !== 0x47) return false;
+        var pusi = (b[o + 1] & 0x40) !== 0;
+        var afc = (b[o + 3] >> 4) & 3;
+        var p = o + 4;
+        if (afc & 2) {
+            var al = b[p];
+            if (al > 0 && p + 7 < o + 188 && (b[p + 1] & 0x10)) {
+                if (onPcr(b, p + 2) === false) return true;
+            }
+            p += 1 + al;
+        }
+        if (!(afc & 1) || !pusi || p + 14 > o + 188) continue;
+        if (b[p] !== 0 || b[p + 1] !== 0 || b[p + 2] !== 1) continue;
+        var sid = b[p + 3];
+        // Stream ids without the optional PES header (padding, private 2, ...).
+        if (sid === 0xbc || sid === 0xbe || sid === 0xbf || sid === 0xf0 || sid === 0xf1 || sid === 0xff || sid === 0xf2 || sid === 0xf8) continue;
+        var ptsDts = b[p + 7] >> 6;
+        if (ptsDts & 2) {
+            if (onPts(b, p + 9) === false) return true;
+            if (ptsDts === 3 && p + 19 <= o + 188) {
+                if (onPts(b, p + 14) === false) return true;
+            }
+        }
+    }
+    return true;
+}
+
+function firstTsTimestamp(b) {
+    var found = -1;
+    walkTsTimestamps(
+        b,
+        function (buf, q) {
+            found = readPts33(buf, q);
+            return false;
+        },
+        function (buf, q) {
+            found = readPcrBase(buf, q);
+            return false;
+        }
+    );
+    return found;
+}
+
+function tsPassOffset(raw) {
+    if (raw < TS_REBASE_THRESHOLD) return 0; // below 2^30: already platform-safe
+    var st = tsPassState;
+    if (st && raw >= st.off && Math.abs(raw - st.last) < TS_REBASE_REKEY_GAP) {
+        if (raw > st.last) st.last = raw;
+        return st.off;
+    }
+    var off = raw > TS_REBASE_HEADROOM ? raw - TS_REBASE_HEADROOM : 0;
+    tsPassState = {off: off, last: raw};
+    logLine('ts rebase offset=' + off + ' raw=' + raw);
+    return off;
+}
+
+// Builds a clean 188-byte PMT packet for native Twitch MPEG-TS segments
+// (PCR on 257, AAC 0x0f on 256, H.264 0x1b on 257), stripping the sparse
+// timed-ID3 metadata stream (0x15 on PID 258, PES stream_id 0xbd) and its
+// program_info descriptors.
+var nativeTsCleanPmt = null;
+function getNativeTsCleanPmtPacket(cc) {
+    if (!nativeTsCleanPmt) {
+        var body = [
+            0x00, 0x01, // program_number = 1
+            0xc1, // reserved(11) + version(0) + current_next(1)
+            0x00, // section_number
+            0x00, // last_section_number
+            0xe0 | ((257 >> 8) & 0x1f),
+            257 & 0xff, // PCR_PID = 257 (video)
+            0xf0, 0x00, // program_info_length = 0
+            0x0f, 0xe0 | ((256 >> 8) & 0x1f), 256 & 0xff, 0xf0, 0x00, // AAC on 256
+            0x1b, 0xe0 | ((257 >> 8) & 0x1f), 257 & 0xff, 0xf0, 0x00  // H.264 on 257
+        ];
+        var sectionLen = body.length + 4;
+        var sec = new Buffer(3 + sectionLen);
+        sec[0] = 0x02; // table_id = PMT
+        sec[1] = 0xb0 | ((sectionLen >> 8) & 0x0f);
+        sec[2] = sectionLen & 0xff;
+        var i;
+        for (i = 0; i < body.length; i++) sec[3 + i] = body[i];
+        sec.writeUInt32BE(mpegCrc(sec, 0, 3 + body.length), 3 + body.length);
+        var pkt = new Buffer(188);
+        pkt[0] = 0x47;
+        pkt[1] = 0x40 | ((PMT_PID >> 8) & 0x1f);
+        pkt[2] = PMT_PID & 0xff;
+        pkt[3] = 0x10;
+        pkt[4] = 0x00; // pointer_field
+        sec.copy(pkt, 5);
+        for (i = 5 + sec.length; i < 188; i++) pkt[i] = 0xff;
+        nativeTsCleanPmt = pkt;
+    }
+    var out = new Buffer(188);
+    nativeTsCleanPmt.copy(out);
+    out[3] = 0x10 | (cc & 0x0f);
+    return out;
+}
+
+// Returns a sanitized + rebased COPY of a raw MPEG-TS segment:
+//   1) Strips PID 258 (0x15 / PES 0xbd timed-ID3 metadata) from PMT and
+//      replaces PID 258 packets with TS null packets (0x1FFF).
+//   2) Rebases PTS/DTS/PCR when raw timestamps exceed 2^30.
+function rebaseTsSegment(raw) {
+    if (tsRebaseDisabled()) return raw;
+    if (!raw || raw.length < 188 || raw[0] !== 0x47) return raw;
+    var first = firstTsTimestamp(raw);
+    var off = first >= 0 ? tsPassOffset(first) : 0;
+    var out = new Buffer(raw.length);
+    raw.copy(out);
+    var o;
+    for (o = 0; o + 188 <= out.length; o += 188) {
+        if (out[o] !== 0x47) return raw;
+        var pid = ((out[o + 1] & 0x1f) << 8) | out[o + 2];
+        if (pid === PMT_PID && (out[o + 1] & 0x40) !== 0) {
+            getNativeTsCleanPmtPacket(out[o + 3] & 0x0f).copy(out, o);
+        } else if (pid === 258) {
+            out[o + 1] = 0x1f;
+            out[o + 2] = 0xff;
+            out[o + 3] = 0x10;
+            for (var k = 4; k < 188; k++) out[o + k] = 0xff;
+        }
+    }
+    if (off) {
+        var ok = walkTsTimestamps(
+            out,
+            function (buf, q) {
+                writePts33(buf, q, (readPts33(buf, q) - off + TS_33BIT) % TS_33BIT);
+            },
+            function (buf, q) {
+                writePcrBase(buf, q, (readPcrBase(buf, q) - off + TS_33BIT) % TS_33BIT);
+            }
+        );
+        if (!ok) return raw;
+    }
+    return out;
+}
+
 function hlsSegment(qs, res) {
     var segUrl = qs.u ? String(qs.u) : '';
     var mapUrl = qs.m ? String(qs.m) : '';
@@ -1180,12 +1711,13 @@ function hlsSegment(qs, res) {
     logLine('segreq ' + segId(segUrl));
     var hit = tsCacheGet(segUrl);
     if (hit) {
-        sendTs(res, hit);
+        sendTs(res, !mapUrl ? rebaseTsSegment(hit) : hit);
         return;
     }
     if (!mapUrl) {
         // MPEG-TS passthrough: no init segment, no transmux - the segment is
-        // already video/mp2t, just fetch and serve (cached for re-fetches).
+        // already video/mp2t, just fetch, cache raw bytes, and serve a rebased
+        // copy so high-uptime (>3.3h) live streams stay below 2^30 ticks.
         fetchBuf(segUrl, function (err, buf) {
             if (err) {
                 logLine('hls seg err ' + err.message + ' ' + segUrl.substring(0, 80));
@@ -1194,7 +1726,7 @@ function hlsSegment(qs, res) {
             }
             tsCachePut(segUrl, buf);
             logLine('hls seg ts ' + buf.length + 'B ' + segUrl.substring(segUrl.length - 40));
-            sendTs(res, buf);
+            sendTs(res, rebaseTsSegment(buf));
         });
         return;
     }
@@ -1312,6 +1844,10 @@ function startServer() {
                 });
                 return;
             }
+            if (p.indexOf('/hls/lseg/') === 0) {
+                hlsLiveSegment(p, qs, req, res);
+                return;
+            }
             if (p === '/hls/seg.ts' || p.indexOf('/hls/seg/') === 0) {
                 hlsSegment(qs, res);
                 return;
@@ -1367,6 +1903,7 @@ module.exports = {
     parseInit: parseInit,
     parseSeg: parseSeg,
     muxSegment: muxSegment,
+    rebaseTsSegment: rebaseTsSegment,
     buildPat: buildPat,
     buildPmt: buildPmt,
     startServer: startServer
