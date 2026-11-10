@@ -980,24 +980,64 @@ function hlsMaster(qs, res) {
             }
         var lines = text.split('\n');
         var out = [];
-        for (var i = 0; i < lines.length; i++) {
+        var outAll = [];
+        var keptVariants = 0;
+        var i;
+        for (i = 0; i < lines.length; i++) {
             var line = lines[i].replace(/\r$/, '');
+            var rewritten = line;
             if (line.charAt(0) === '#') {
-                out.push(
-                    line.replace(/URI="([^"]+)"/g, function (m, u) {
-                        var abs = url.resolve(src, u);
-                        return /^https:\/\//.test(abs) ? 'URI="' + localVar(abs) + '"' : m;
-                    })
-                );
+                rewritten = line.replace(/URI="([^"]+)"/g, function (m, u) {
+                    var abs = url.resolve(src, u);
+                    return /^https:\/\//.test(abs) ? 'URI="' + localVar(abs) + '"' : m;
+                });
             } else if (line.length) {
                 var abs2 = url.resolve(src, line);
-                out.push(/^https:\/\//.test(abs2) ? localVar(abs2) : line);
-            } else {
-                out.push(line);
+                rewritten = /^https:\/\//.test(abs2) ? localVar(abs2) : line;
             }
+            // Fix C (docs/Live_Playback_and_Adblock_Fixes.md): strip 1080p+ and
+            // >4.2Mbps variants so the platform's native ABR only ever climbs
+            // to 720p on webOS 3.4 hardware over flaky WiFi. Both the filtered
+            // (out) and unfiltered (outAll) copies get every line.
+            var drop = false;
+            if (line.indexOf('#EXT-X-STREAM-INF:') === 0) {
+                var resM = line.match(/RESOLUTION=(\d+)x(\d+)/i);
+                var bwM = line.match(/BANDWIDTH=(\d+)/i);
+                var vw = resM ? parseInt(resM[1], 10) : 0;
+                var vh = resM ? parseInt(resM[2], 10) : 0;
+                var vbw = bwM ? parseInt(bwM[1], 10) : 0;
+                drop = (vw > 1280 || vh > 720 || vbw > 4200000) && i + 1 < lines.length;
+                if (!drop) keptVariants++;
+            }
+            outAll.push(rewritten);
+            if (drop) {
+                // Also keep the variant URI line in outAll, then skip both in out.
+                i++;
+                if (i < lines.length) {
+                    var nextLine = lines[i].replace(/\r$/, '');
+                    if (nextLine.charAt(0) === '#') {
+                        outAll.push(
+                            nextLine.replace(/URI="([^"]+)"/g, function (m, u) {
+                                var abs = url.resolve(src, u);
+                                return /^https:\/\//.test(abs) ? 'URI="' + localVar(abs) + '"' : m;
+                            })
+                        );
+                    } else if (nextLine.length) {
+                        var abs3 = url.resolve(src, nextLine);
+                        outAll.push(/^https:\/\//.test(abs3) ? localVar(abs3) : nextLine);
+                    } else {
+                        outAll.push(nextLine);
+                    }
+                }
+                continue;
+            }
+            out.push(rewritten);
         }
-        logLine('hls master ok ' + src.substring(0, 80));
-        sendText(res, out.join('\n'));
+        logLine('hls master ok ' + src.substring(0, 80) + ' kept=' + keptVariants);
+        // If the filter removed every variant (source-only channel that only
+        // offers 1080p), serve the unfiltered rewrite rather than an empty
+        // ladder - outAll still points every URI at the local server.
+        sendText(res, keptVariants > 0 ? out.join('\n') : outAll.join('\n'));
     }, staticMode);
 }
 
@@ -1024,26 +1064,56 @@ function hlsRewriteVariant(base, text, res) {
     var baseSeq = parseInt(seq, 10);
     if (isNaN(baseSeq)) baseSeq = 0;
     var segIdx = 0;
+    var skipAdSegment = false;
+    var adStripped = 0;
     for (i = 0; i < lines.length; i++) {
         var line = lines[i].replace(/\r$/, '');
-        if (line.indexOf('#EXT-X-MAP:') === 0) continue; // TS is self-contained
-        if (line.charAt(0) === '#') {
-            out.push(line);
+        // Fix C (docs/Live_Playback_and_Adblock_Fixes.md): strip low-latency
+        // prefetch pointers - the webOS 3.4 HLS demuxer mishandles them and
+        // starves at a 1-frame live edge.
+        if (line.indexOf('#EXT-X-TWITCH-PREFETCH:') === 0) continue;
+        // Fix C: strip Twitch SSAI mid-roll markers so the ad window is no
+        // longer announced to the platform player.
+        if (line.indexOf('#EXT-X-DATERANGE:') === 0 &&
+            (line.indexOf('stitched-ad') !== -1 ||
+             line.indexOf('twitch-stitched-ad') !== -1 ||
+             line.indexOf('Amazon') !== -1)) {
             continue;
         }
-        if (line.length) {
+        var isUriLine = line.length > 0 && line.charAt(0) !== '#';
+        if (skipAdSegment) {
+            // Consume the ad segment URI (the intervening #EXT-X-DISCONTINUITY
+            // and tags go with it); keep counting it so media-sequence based
+            // segment paths stay stable across playlist refreshes.
+            if (isUriLine) {
+                skipAdSegment = false;
+                adStripped++;
+                segIdx++;
+            }
+            continue;
+        }
+        if (isUriLine) {
             var abs = url.resolve(base, line);
+            var segPos = baseSeq + segIdx;
+            segIdx++;
             if (!firstSeg) firstSeg = segId(abs);
             lastSeg = segId(abs);
             allIds.push(segId(abs));
             segCount++;
-            out.push(/^https:\/\//.test(abs) ? localSeg(abs, mapAbs, baseSeq + segIdx) : line);
-            segIdx++;
-        } else {
-            out.push(line);
+            out.push(/^https:\/\//.test(abs) ? localSeg(abs, mapAbs, segPos) : line);
+            continue;
         }
+        // Fix C: skip ad-stitched segments (#EXTINF:2.000,Amazon|... etc).
+        if (line.indexOf('#EXTINF:') === 0 &&
+            line.indexOf(',live') === -1 &&
+            (line.indexOf('Amazon') !== -1 || line.indexOf('stitched-ad') !== -1)) {
+            skipAdSegment = true;
+            continue;
+        }
+        if (line.indexOf('#EXT-X-MAP:') === 0) continue; // TS is self-contained
+        out.push(line);
     }
-    logLine('varserve seq=' + seq + ' n=' + segCount + ' ids=' + allIds.join(','));
+    logLine('varserve seq=' + seq + ' n=' + segCount + ' adStripped=' + adStripped + ' ids=' + allIds.join(','));
     sendText(res, out.join('\n'));
 }
 
@@ -1101,7 +1171,9 @@ function tsCachePut(k, v) {
 function hlsSegment(qs, res) {
     var segUrl = qs.u ? String(qs.u) : '';
     var mapUrl = qs.m ? String(qs.m) : '';
-    if (!/^https:\/\//.test(segUrl) || !/^https:\/\//.test(mapUrl)) {
+    // No m= param means an MPEG-TS source (live TS routed through the
+    // sanitizer, Fix C): valid, handled by the passthrough branch below.
+    if (!/^https:\/\//.test(segUrl) || (mapUrl && !/^https:\/\//.test(mapUrl))) {
         sendErr(res, 400, 'bad url');
         return;
     }
@@ -1109,6 +1181,21 @@ function hlsSegment(qs, res) {
     var hit = tsCacheGet(segUrl);
     if (hit) {
         sendTs(res, hit);
+        return;
+    }
+    if (!mapUrl) {
+        // MPEG-TS passthrough: no init segment, no transmux - the segment is
+        // already video/mp2t, just fetch and serve (cached for re-fetches).
+        fetchBuf(segUrl, function (err, buf) {
+            if (err) {
+                logLine('hls seg err ' + err.message + ' ' + segUrl.substring(0, 80));
+                sendErr(res, 502, 'segment fetch failed');
+                return;
+            }
+            tsCachePut(segUrl, buf);
+            logLine('hls seg ts ' + buf.length + 'B ' + segUrl.substring(segUrl.length - 40));
+            sendTs(res, buf);
+        });
         return;
     }
     getInitInfo(mapUrl, function (err, info) {

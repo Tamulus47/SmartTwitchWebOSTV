@@ -16,8 +16,14 @@ var service = new Service(pkgInfo.name);
 var MAX_RESPONSE_BYTES = 1024 * 1024;
 var DEFAULT_TIMEOUT_MS = 4500;
 var MIN_TIMEOUT_MS = 1200;
-var MAX_TIMEOUT_MS = 7000;
+// Fix A (docs/Live_Playback_and_Adblock_Fixes.md): ad-free proxy fetches must
+// survive TV WiFi jitter - allow up to 8s before giving up (plus one retry).
+var MAX_TIMEOUT_MS = 8000;
 var DEFAULT_ACCEPT_LANGUAGE = 'en-US,en;q=0.9';
+// Clean browser identity for ad-free proxy hosts (they 403 on foreign
+// Origin/Referer headers and expect a normal browser User-Agent).
+var CLEAN_PROXY_USER_AGENT =
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 function clampTimeout(value) {
     var parsed = parseInt(value, 10);
@@ -37,6 +43,16 @@ function isAllowedPlaylistUrl(parsedUrl) {
     // MSE playback; Chrome's native HLS cannot decode fMP4 segments.
     if (/\.playlist\.ttvnw\.net$/.test(hostname)) {
         return path.indexOf('/v1/playlist/') === 0;
+    }
+    // Ad-free proxy tier hosts (Fix A): Tier 1 serves /live/<channel> with no
+    // .m3u8 extension, so allow these by host - rejecting them here made the
+    // chain fall back to the direct ad-laden master.
+    if (hostname === 'as.luminous.dev' ||
+        /\.luminous\.dev$/.test(hostname) ||
+        /\.rte\.net\.ru$/.test(hostname) ||
+        /\.r\.tedd\.dev$/.test(hostname) ||
+        hostname.indexOf('perfprod.com') !== -1) {
+        return true;
     }
     // Master playlists (usher.ttvnw.net) and media playlists (cloudfront VOD
     // hosts such as d1m7jfoe9zdc1j.cloudfront.net/.../index-dvr.m3u8).
@@ -103,8 +119,18 @@ service.register('fetchPlaylist', function (message) {
     };
     // playlist.ttvnw.net (variant playlists) rejects unknown Origin headers
     // with 403; only forward browser identity headers to usher.
-    var isVariantHost = /\.playlist\.ttvnw\.net$/.test(String(parsedUrl.hostname || '').toLowerCase());
-    if (!isVariantHost) {
+    var hostnameLower = String(parsedUrl.hostname || '').toLowerCase();
+    var isVariantHost = /\.playlist\.ttvnw\.net$/.test(hostnameLower);
+    // Ad-free proxy hosts (Fix A): send a clean browser User-Agent and drop
+    // Origin/Referer entirely - a foreign Origin makes them answer 403.
+    var isProxyHost = hostnameLower === 'as.luminous.dev' ||
+        /\.luminous\.dev$/.test(hostnameLower) ||
+        /\.rte\.net\.ru$/.test(hostnameLower) ||
+        /\.r\.tedd\.dev$/.test(hostnameLower) ||
+        hostnameLower.indexOf('perfprod.com') !== -1;
+    if (isProxyHost) {
+        requestHeaders['User-Agent'] = CLEAN_PROXY_USER_AGENT;
+    } else if (!isVariantHost) {
         if (requestOrigin) requestHeaders.Origin = requestOrigin;
         if (requestReferer) requestHeaders.Referer = requestReferer;
         if (requestUserAgent) requestHeaders['User-Agent'] = requestUserAgent;
@@ -112,7 +138,10 @@ service.register('fetchPlaylist', function (message) {
     requestHeaders['Sec-Fetch-Mode'] = 'cors';
     requestHeaders['Sec-Fetch-Site'] = 'cross-site';
 
-    var req = https.request(
+    var attempt = 0;
+    var startRequest = function () {
+        attempt++;
+        var req = https.request(
         {
             protocol: 'https:',
             hostname: parsedUrl.hostname,
@@ -190,6 +219,12 @@ service.register('fetchPlaylist', function (message) {
         if (finished) return;
         var messageText = err && err.message ? String(err.message) : 'Network request failed';
         var errorCode = messageText === 'RESPONSE_TOO_LARGE' ? 'RESPONSE_TOO_LARGE' : messageText === 'TIMEOUT' ? 'TIMEOUT' : 'NETWORK_ERROR';
+        // Fix A: one retry on transient network errors (TV WiFi jitter) - a
+        // dropped first attempt must not bounce the ad-free chain to direct.
+        if (attempt < 2 && errorCode === 'NETWORK_ERROR') {
+            setTimeout(startRequest, 400);
+            return;
+        }
         var statusCode = messageText === 'RESPONSE_TOO_LARGE' ? 413 : messageText === 'TIMEOUT' ? 504 : 502;
         finalize({
             returnValue: false,
@@ -200,6 +235,8 @@ service.register('fetchPlaylist', function (message) {
     });
 
     req.end();
+    };
+    startRequest();
 });
 
 

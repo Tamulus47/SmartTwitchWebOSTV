@@ -109,6 +109,25 @@
     var sideRect = null;       // Side panel rect {left, top, width, height}.
     var mainMaxRes = 0;        // Max resolution cap for main player (0 = unlimited).
     var smallMaxRes = 0;       // Max resolution cap for preview player (0 = unlimited).
+    // Last master body fetched through the ad-free proxy chain (Plan B). Kept so
+    // sourceFromQuality() can always recover a playable variant list even when
+    // the app hands us an empty playlist or a non-proxy rawUri - the proxied
+    // body must never be silently bypassed (docs/Live_Playback_and_Adblock_Fixes.md, Fix B.2).
+    var lastProxiedMasterBody = '';
+    var lastProxiedMasterUrl = '';
+    // --- webOS 3.4 live quality ceiling (Fix B.1) ---
+    // The 2016 SoC + flaky WiFi cannot sustain Twitch's 1080p60 live rung: a
+    // 6-8 Mbps variant delivered in 2-second segments never refills the buffer,
+    // so playback degenerates into "1 frame -> spinner -> 1 frame" while VODs
+    // (long static buffers) play fine. LIVE attaches are therefore capped at
+    // 720p / 3.5 Mbps with 30fps preferred; VOD/clip keep full quality.
+    // See docs/Live_Playback_and_Adblock_Fixes.md (Fix B).
+    var LIVE_MAX_HEIGHT = 720;
+    var LIVE_MAX_BANDWIDTH = 3500000;
+    // Play.js OSInterface_StartAuto who_called: 1 = live, 2 = VOD, 3 = clip.
+    function isLiveStreamState(state) {
+        return !!state && state.type !== 2 && state.type !== 3;
+    }
     // --- Storage & constants ---
     var STORAGE_PREFIX = 'sttv_webos_';
     // Persist last seen hosted WebTag to avoid repeated reloads for the same build.
@@ -1397,7 +1416,7 @@
             var f = fm && fm[1] ? Math.round(parseFloat(fm[1]) / 10) * 10 : 30;
             var bw = bm && bm[1] ? parseInt(bm[1], 10) : 0;
             var id = r > 0 ? r + 'p' + f : 'Auto';
-            var item = {id: id, resolution: r, url: toAbsoluteUrl(n, rawBaseUri), codecs: cm && cm[1] ? cm[1] : '', bandwidth: bw > 0 ? bw : 0};
+            var item = {id: id, resolution: r, url: toAbsoluteUrl(n, rawBaseUri), codecs: cm && cm[1] ? cm[1] : '', bandwidth: bw > 0 ? bw : 0, fps: f};
             if (typeof seen[id] === 'undefined') {
                 seen[id] = out.length;
                 out.push(item);
@@ -2080,17 +2099,52 @@
         }
         if (pv) { var s = clamp(ps.slot, 1, 3); pv.volume = clamp((audioEnabled[s] ? audioVolumes[s] : 0) * previewScale, 0, 1); }
     }
-    function pickFromMaster(rawUri, list, maxRes) {
+    // Picks a single variant URL from the parsed master list. Optional caps:
+    //   maxRes      - highest resolution (height) allowed
+    //   maxBw       - highest bandwidth (bps) allowed
+    //   preferLowFps- at equal resolution prefer <=31fps (720p30 over 720p60)
+    // Callers pass the webOS 3.4 live ceiling (LIVE_MAX_HEIGHT / LIVE_MAX_BANDWIDTH)
+    // for live streams so the platform never attaches 1080p60 - see Fix B.1 in
+    // docs/Live_Playback_and_Adblock_Fixes.md. When no cap matches, falls back to
+    // the lowest-resolution variant (never rawUri) so playback still starts.
+    function pickFromMaster(rawUri, list, maxRes, maxBw, preferLowFps) {
         if (list && list.length) {
             var supported = list.filter(function (item) {
                 return isCodecSetSupported(item.codecs);
             });
             var candidates = supported.length ? supported : list;
-            if (maxRes > 0) {
-                var i;
+            var capRes = maxRes > 0 ? maxRes : 0;
+            var capBw = maxBw > 0 ? maxBw : 0;
+            var i;
+            if (capRes > 0 || capBw > 0) {
+                var eligible = [];
                 for (i = 0; i < candidates.length; i++) {
-                    if (candidates[i].resolution > 0 && candidates[i].resolution <= maxRes) return candidates[i].url;
+                    var it = candidates[i];
+                    var resOk = capRes <= 0 || !it.resolution || it.resolution <= capRes;
+                    var bwOk = capBw <= 0 || !it.bandwidth || it.bandwidth <= capBw;
+                    if (resOk && bwOk) eligible.push(it);
                 }
+                if (eligible.length) {
+                    eligible.sort(function (a, b) {
+                        var ar = a.resolution || 0;
+                        var br = b.resolution || 0;
+                        if (ar !== br) return br - ar;
+                        if (preferLowFps) {
+                            var af = a.fps || 0;
+                            var bf = b.fps || 0;
+                            if (af && bf && af !== bf) {
+                                var al = af <= 31 ? 0 : 1;
+                                var bl = bf <= 31 ? 0 : 1;
+                                if (al !== bl) return al - bl;
+                            }
+                        }
+                        return (b.bandwidth || 0) - (a.bandwidth || 0);
+                    });
+                    return eligible[0].url;
+                }
+                // Caps exclude every variant (source-only channel that only
+                // offers 1080p): take the lowest-resolution option so the
+                // stream still plays instead of failing over to rawUri.
                 return candidates[candidates.length - 1].url;
             }
             return candidates[0].url;
@@ -2102,6 +2156,26 @@
     function sourceFromQuality(state, maxRes) {
         if (!state) return '';
         if (state.qp >= 0 && state.q[state.qp]) return state.q[state.qp].url;
+        var list = state.q;
+        // Plan B guard (Fix B.2): a missing parsed list must never leak a
+        // proxy-host URL to the native stack (its fetch of as.luminous.dev /
+        // rte prefix hosts fails with MEDIA_ERR_SRC_NOT_SUPPORTED). Re-parse
+        // the last proxied master body so a variant from it is always found.
+        if ((!list || !list.length) && lastProxiedMasterBody && isAdfreeProxyUrl(state.rawUri)) {
+            list = parseQ(lastProxiedMasterBody, lastProxiedMasterUrl || state.rawUri);
+        }
+        // Live quality ceiling (Fix B.1): cap the single-variant pick at
+        // 720p / 3.5 Mbps and prefer 30fps. VOD/clip and the direct-master
+        // attach path (native ABR) are untouched.
+        var live = isLiveStreamState(state);
+        var capRes = maxRes > 0 ? maxRes : 0;
+        var capBw = 0;
+        var preferLowFps = false;
+        if (live) {
+            if (!capRes || capRes > LIVE_MAX_HEIGHT) capRes = LIVE_MAX_HEIGHT;
+            capBw = LIVE_MAX_BANDWIDTH;
+            preferLowFps = true;
+        }
         if (state.rawUri && (!maxRes || maxRes <= 0)) {
             // Plan B: never hand the platform media stack a proxy-host master
             // URL (as.luminous.dev / rte prefix proxies) - its native fetch of
@@ -2113,12 +2187,14 @@
             // ttvnw family. Falls back to rawUri when the body has no usable
             // variant (same as the pre-Plan-B behavior).
             if (isAdfreeProxyUrl(state.rawUri)) {
-                var adfreeVariant = pickFromMaster(state.rawUri, state.q, maxRes);
+                var adfreeVariant = pickFromMaster(state.rawUri, list, capRes, capBw, preferLowFps);
                 if (adfreeVariant && adfreeVariant !== state.rawUri) return adfreeVariant;
             }
+            // Direct flow: attach the master URL itself so the platform's own
+            // native ABR picks a variant (never a proxy-host URL here).
             return state.rawUri;
         }
-        return pickFromMaster(state.rawUri, state.q, maxRes);
+        return pickFromMaster(state.rawUri, list, capRes, capBw, preferLowFps);
     }
     function normalizeQualityPosition(pos, listLength) {
         var parsed = -1;
@@ -2369,6 +2445,17 @@
                 if (maybeAutoClearMainLoading('stall_timer', 1000)) return;
                 if (attemptDecoderJamRecovery()) return;
                 handleMainPlaybackFailure(1, 0);
+                return;
+            }
+            // Fix B.3 (docs/Live_Playback_and_Adblock_Fixes.md): classification
+            // here is 'network_buffering' - a buffer underrun. NEVER reload
+            // src for a LIVE stream on a transient underrun: mv.load() aborts
+            // the in-flight segment fetch, restarts the playlist at the live
+            // edge and renders one frame - the "1 frame -> spinner" loop. The
+            // native HLS client is already refetching; a genuinely dead stream
+            // is escalated by sttvStallWatchdog (>=25s -> RestartPlayer).
+            if ((ms.type || 1) === 1) {
+                debugStallDecision('live_edge_starvation', 'stall_timer_no_reload');
                 return;
             }
             if (maybeAutoClearMainLoading('stall_timer', 1000)) return;
@@ -3104,6 +3191,13 @@
     // Attaches the native HLS source to the main video (MPEG-TS channels).
     function attachNativeMain() {
         if (!mv) return;
+        // Live: attach through the local playlist sanitizer first (Fix C);
+        // attachMainSrc() health-checks the server and falls back to a direct
+        // attach of ms.uri when it is down - identical to the pre-route path.
+        if (isLiveStreamState(ms) && ms.uri && ms.uri.indexOf(REMUX_BASE) !== 0 && liveServeEnabled()) {
+            attachMainSrc(ms.uri);
+            return;
+        }
         // Never inherit a stale CORS-mode flag left by the local remux path:
         // ttvnw answers 403 to any request carrying a foreign Origin, so a
         // native ttvnw variant attached with crossorigin=anonymous would fail
@@ -3158,6 +3252,83 @@
         return REMUX_BASE + '/hls/master.m3u8?u=' + encodeURIComponent(originalUrl);
     }
 
+    // --- live playlist sanitizer route (Fix C) -----------------------------
+    // Live attaches go through the local tv-serve sanitizer so
+    // #EXT-X-TWITCH-PREFETCH and stitched-ad mid-rolls are stripped before the
+    // platform player sees them, and so a proxied/direct master keeps native
+    // ABR over a <=720p ladder (docs/Live_Playback_and_Adblock_Fixes.md, Fix C).
+    // tv-serve answers /health in milliseconds when up; on failure the stream
+    // attaches directly exactly like before this route existed. Kill switches:
+    // ?sttv_live_serve=0 or localStorage STTV_LIVE_SERVE=0.
+    function liveServeEnabled() {
+        try {
+            if (w.location && typeof w.location.search === 'string' && /(?:\?|&)sttv_live_serve=0(?:&|$)/.test(w.location.search)) return false;
+        } catch (e0) {}
+        try {
+            if (w.localStorage && w.localStorage.getItem('STTV_LIVE_SERVE') === '0') return false;
+        } catch (e1) {}
+        return true;
+    }
+
+    // Attaches `uri` for the main player: live streams are wrapped in the
+    // local sanitizer (health-checked first), everything else attaches as-is.
+    function attachMainSrc(uri) {
+        if (!uri) return;
+        if (!isLiveStreamState(ms) || !liveServeEnabled() || uri.indexOf(REMUX_BASE) === 0) {
+            attachNativeMainTo(uri);
+            return;
+        }
+        var target = uri;
+        var wrapped = remuxUrlFor(target);
+        var settled = false;
+        var retried = false;
+        var retryTimer = 0;
+        function finish(reason) {
+            if (settled) return;
+            settled = true;
+            w.clearTimeout(guardTimer);
+            if (retryTimer) w.clearTimeout(retryTimer);
+            if (reason) {
+                bridgeDebugLog('live_serve_down', {reason: reason, fallback: 'direct'});
+                attachNativeMainTo(target);
+            } else {
+                bridgeDebugLog('live_serve_start', {url: String(target).substring(0, 90)});
+                attachNativeMainTo(wrapped);
+            }
+        }
+        function probe() {
+            if (settled) return;
+            try {
+                var x = new XMLHttpRequest();
+                x.open('GET', REMUX_BASE + '/health', true);
+                x.timeout = 2500;
+                x.onload = function () {
+                    if (settled) return;
+                    if (x.status === 200 && String(x.responseText || '').indexOf('ok') !== -1) finish('');
+                    else retry('health_status_' + x.status);
+                };
+                x.onerror = function () { retry('health_unreachable'); };
+                x.ontimeout = function () { retry('health_timeout'); };
+                x.send();
+            } catch (eHealth) {
+                finish('health_exception');
+            }
+        }
+        function retry(reason) {
+            if (settled) return;
+            if (!retried) {
+                retried = true;
+                bridgeDebugLog('live_serve_retry', {reason: reason});
+                ensureSttvServe();
+                retryTimer = w.setTimeout(probe, 3500);
+                return;
+            }
+            finish(reason);
+        }
+        var guardTimer = w.setTimeout(function () { finish('guard_timeout'); }, 8000);
+        probe();
+    }
+
     function startRemuxNative(probeUrl, gen, parsed) {
         var settled = false;
         var healthRetried = false;
@@ -3189,8 +3360,15 @@
             if (ok) {
                 settled = true;
                 w.clearTimeout(timer);
+                var remuxTarget = remuxUrlFor(probeUrl);
+                // The live sanitizer route (Fix C) may already hold this exact
+                // URL - re-attaching would reload a playing stream for nothing.
+                if (mv && String(mv.src || '') === remuxTarget) {
+                    bridgeDebugLog('remux_native_start', {url: String(probeUrl).substring(0, 90), alreadyAttached: true});
+                    return;
+                }
                 bridgeDebugLog('remux_native_start', {url: String(probeUrl).substring(0, 90)});
-                attachNativeMainTo(remuxUrlFor(probeUrl));
+                attachNativeMainTo(remuxTarget);
                 return;
             }
             if (!healthRetried) {
@@ -4899,6 +5077,10 @@
                         len: proxyResult.text.length,
                         url: String(proxyResult.url).substring(0, 120)
                     });
+                    // Keep the proxied master body so sourceFromQuality() can
+                    // always recover a Plan B variant list from it (Fix B.2).
+                    lastProxiedMasterBody = proxyResult.text;
+                    lastProxiedMasterUrl = String(proxyResult.url || '');
                     // Mirror the service path's caching (synthetic finish skips
                     // it): the sync stale-while-revalidate path and the service
                     // fallback both read these caches by channel request key.
@@ -5967,6 +6149,13 @@
             var tg = sourceFromQuality(ms, mainMaxRes);
             var currentSrc = (mv.currentSrc || mv.src || '');
             var sameTarget = !!(tg && (tg === currentSrc || tg === mv.src));
+            if (!sameTarget && tg && isLiveStreamState(ms) && liveServeEnabled()) {
+                // Live attaches may be wrapped in the local sanitizer route
+                // (Fix C) - compare against the wrapped form too so a repeated
+                // SetQuality does not reload a playing stream.
+                var wrappedTg = remuxUrlFor(tg);
+                sameTarget = wrappedTg === currentSrc || wrappedTg === mv.src;
+            }
             bridgeDebugLog('set_quality_attempt', {
                 rawPos: requestedPos,
                 rawType: typeof requestedPos,
@@ -5994,8 +6183,13 @@
                 ms.resume = ms.type === 2 || ms.type === 3 ? mtime() : 0;
                 if (!isFinite(ms.resume)) ms.resume = 0;
                 ms.uri = tg;
-                mv.src = tg;
-                try { mv.load(); } catch (e) {}
+                if (isLiveStreamState(ms) && liveServeEnabled() && tg.indexOf(REMUX_BASE) !== 0) {
+                    // Live: keep the sanitizer route (Fix C) on quality swaps.
+                    attachMainSrc(tg);
+                } else {
+                    mv.src = tg;
+                    try { mv.load(); } catch (e) {}
+                }
                 tryPlay(mv);
                 bridgeDebugLog('set_quality_applied', {pos: ms.qp, available: ms.q.length, flow: 'native-ts'});
                 return;
