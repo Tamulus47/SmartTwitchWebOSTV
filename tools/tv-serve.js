@@ -117,8 +117,8 @@ function proxyPass(target, res, redirects) {
 // =========================================================================
 
 var INIT_CACHE_MAX = 8;
-var TS_CACHE_MAX_ITEMS = 48;
-var TS_CACHE_MAX_BYTES = 64 * 1024 * 1024;
+var TS_CACHE_MAX_ITEMS = 150;
+var TS_CACHE_MAX_BYTES = 48 * 1024 * 1024;
 // The server lives only while SmartTwitch is open (started by the wrapper /
 // bridge on app open, stopped on app close). The app page pings /health every
 // 10s while it is alive, so no request for STTV_SERVE_HEARTBEAT_EXIT_MS means
@@ -932,7 +932,7 @@ function ensureVariantTimer(u) {
     varInterest[u] = Date.now();
     if (varTimers[u]) return;
     varTimers[u] = setInterval(function () {
-        if (Date.now() - (varInterest[u] || 0) > 45000) {
+        if (Date.now() - (varInterest[u] || 0) > 180000) {
             clearInterval(varTimers[u]);
             delete varTimers[u];
             return;
@@ -1046,6 +1046,7 @@ var liveSessionsById = {};
 var liveSessionsByBase = {};
 var liveSessionOrder = [];
 var liveSessionSeq = 0;
+var activeLiveSession = null;
 var LIVE_VIRTUAL_VOD_SEGMENTS = 1800; // 1 hour @ 2s/segment
 var LIVE_INITIAL_SEED_SEGMENTS = 6; // 12s immediately available buffer
 
@@ -1181,6 +1182,7 @@ function feedLiveSession(base, text) {
     var parsed = parseLiveVariantItems(base, text);
     if (parsed.isVod || !parsed.items.length) return;
     var added = 0;
+    var isActive = sess === activeLiveSession && Date.now() - sess.lastReqAt < 180000;
     var i;
     for (i = 0; i < parsed.items.length; i++) {
         var cand = parsed.items[i];
@@ -1189,7 +1191,7 @@ function feedLiveSession(base, text) {
             sess.seenIds[cand.id] = true;
             sess.lastPos = cand.pos;
             added++;
-            if (sess.queue.length - 1 <= sess.maxReqIdx + 2) {
+            if (isActive || sess.queue.length - 1 <= sess.maxReqIdx + 2) {
                 prefetchLiveItem(cand);
             }
         }
@@ -1204,6 +1206,7 @@ function getOrCreateLiveSession(base, parsed) {
     var nowMs = Date.now();
     var existing = liveSessionsByBase[base];
     if (existing && nowMs - existing.createdAt < 4000 && existing.maxReqIdx <= 0 && existing.queue.length > 0) {
+        activeLiveSession = existing;
         return existing;
     }
     var items = parsed.items;
@@ -1233,6 +1236,7 @@ function getOrCreateLiveSession(base, parsed) {
     liveSessionsByBase[base] = sess;
     liveSessionsById[sessId] = sess;
     liveSessionOrder.push(sessId);
+    activeLiveSession = sess;
     while (liveSessionOrder.length > 8) {
         var oldId = liveSessionOrder.shift();
         var oldSess = liveSessionsById[oldId];
@@ -1240,12 +1244,45 @@ function getOrCreateLiveSession(base, parsed) {
             if (liveSessionsByBase[oldSess.base] === oldSess) {
                 delete liveSessionsByBase[oldSess.base];
             }
+            if (activeLiveSession === oldSess) {
+                activeLiveSession = null;
+            }
             delete liveSessionsById[oldId];
         }
     }
-    if (sess.queue[0]) prefetchLiveItem(sess.queue[0]);
-    if (sess.queue[1]) prefetchLiveItem(sess.queue[1]);
+    for (i = 0; i < sess.queue.length; i++) {
+        prefetchLiveItem(sess.queue[i]);
+    }
     return sess;
+}
+
+function getLiveHealthSuffix() {
+    var sess = activeLiveSession;
+    if (!sess || !sess.queue || !sess.queue.length) return '';
+    if (Date.now() - sess.createdAt > 14400000) return '';
+    varInterest[sess.base] = Date.now();
+    sess.lastReqAt = Date.now();
+    ensureVariantTimer(sess.base);
+    var segDur = sess.segDur > 0 ? sess.segDur : 2.0;
+    var minIdx = 0;
+    var foundCached = false;
+    var i;
+    for (i = 0; i < sess.queue.length; i++) {
+        if (tsCache[sess.queue[i].segUrl]) {
+            minIdx = i;
+            foundCached = true;
+            break;
+        }
+    }
+    if (!foundCached) minIdx = 0;
+    var minSec = Math.floor(minIdx * segDur);
+    var maxSec = Math.floor(sess.queue.length * segDur);
+    return ' ' + JSON.stringify({
+        sess: sess.id,
+        minSec: minSec,
+        maxSec: maxSec,
+        segDur: segDur
+    });
 }
 
 function buildLiveVirtualVodPlaylist(sess) {
@@ -1280,13 +1317,37 @@ function hlsLiveSegment(p, qs, req, res) {
         sendErr(res, 400, 'bad segment index');
         return;
     }
+    activeLiveSession = sess;
     sess.lastReqAt = Date.now();
     if (idx > sess.maxReqIdx) sess.maxReqIdx = idx;
     ensureVariantTimer(sess.base);
 
+    function findNearestCachedItem(startIdx) {
+        var k;
+        for (k = startIdx; k < sess.queue.length; k++) {
+            if (sess.queue[k] && tsCache[sess.queue[k].segUrl]) return sess.queue[k];
+        }
+        for (k = Math.min(startIdx - 1, sess.queue.length - 1); k >= 0; k--) {
+            if (sess.queue[k] && tsCache[sess.queue[k].segUrl]) return sess.queue[k];
+        }
+        return null;
+    }
+
     function serveItem(item) {
         if (sess.queue[idx + 1]) prefetchLiveItem(sess.queue[idx + 1]);
-        hlsSegment({u: item.segUrl, m: item.mapUrl || ''}, res);
+        hlsSegment(
+            {u: item.segUrl, m: item.mapUrl || ''},
+            res,
+            function () {
+                var alt = findNearestCachedItem(idx);
+                if (!alt) return false;
+                var cachedBuf = tsCacheGet(alt.segUrl);
+                if (!cachedBuf) return false;
+                logLine('lseg expired fallback idx=' + idx + ' -> ' + segId(alt.segUrl));
+                sendTs(res, !alt.mapUrl ? rebaseTsSegment(cachedBuf) : cachedBuf);
+                return true;
+            }
+        );
     }
 
     if (idx < sess.queue.length) {
@@ -1482,7 +1543,11 @@ function tsCacheGet(k) {
 }
 
 function tsCachePut(k, v) {
-    if (tsCache[k]) tsCacheBytes -= tsCache[k].length;
+    if (tsCache[k]) {
+        tsCacheBytes -= tsCache[k].length;
+        var idx = tsCacheOrder.indexOf(k);
+        if (idx >= 0) tsCacheOrder.splice(idx, 1);
+    }
     tsCache[k] = v;
     tsCacheBytes += v.length;
     tsCacheOrder.push(k);
@@ -1514,7 +1579,7 @@ function tsCachePut(k, v) {
 // response gets a rebased copy. Kill switch: touch /tmp/sttv_no_ts_rebase.
 var TS_REBASE_THRESHOLD = 1073741824; // 2^30 ticks (~3.31h): rebase only above this
 var TS_REBASE_HEADROOM = 54000000; // 600s of backfill headroom (90kHz)
-var TS_REBASE_REKEY_GAP = 54000000; // >10min jump = different timeline
+var TS_REBASE_REKEY_GAP = 1296000000; // >4h jump = different timeline
 var TS_33BIT = 8589934592; // 2^33 PTS/PCR wrap
 var tsPassState = null;
 
@@ -1699,7 +1764,7 @@ function rebaseTsSegment(raw) {
     return out;
 }
 
-function hlsSegment(qs, res) {
+function hlsSegment(qs, res, onErrFallback) {
     var segUrl = qs.u ? String(qs.u) : '';
     var mapUrl = qs.m ? String(qs.m) : '';
     // No m= param means an MPEG-TS source (live TS routed through the
@@ -1721,6 +1786,7 @@ function hlsSegment(qs, res) {
         fetchBuf(segUrl, function (err, buf) {
             if (err) {
                 logLine('hls seg err ' + err.message + ' ' + segUrl.substring(0, 80));
+                if (typeof onErrFallback === 'function' && onErrFallback(err)) return;
                 sendErr(res, 502, 'segment fetch failed');
                 return;
             }
@@ -1733,12 +1799,14 @@ function hlsSegment(qs, res) {
     getInitInfo(mapUrl, function (err, info) {
         if (err) {
             logLine('hls init err ' + err.message);
+            if (typeof onErrFallback === 'function' && onErrFallback(err)) return;
             sendErr(res, 502, 'init fetch failed');
             return;
         }
         fetchBuf(segUrl, function (err2, segBuf) {
             if (err2) {
                 logLine('hls seg err ' + err2.message + ' ' + segUrl.substring(0, 80));
+                if (typeof onErrFallback === 'function' && onErrFallback(err2)) return;
                 sendErr(res, 502, 'segment fetch failed');
                 return;
             }
@@ -1822,7 +1890,7 @@ function startServer() {
                     'Cache-Control': 'no-store',
                     'Access-Control-Allow-Origin': '*'
                 });
-                res.end('ok');
+                res.end('ok' + getLiveHealthSuffix());
                 return;
             }
             if (p === '/hls/master.m3u8') {

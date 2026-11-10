@@ -1545,6 +1545,19 @@
             scheduleMainStallCheck();
             if (mse && !mse.dead) mseHandleSeek(mse);
         });
+        // seeked: seek finished. Reset stall baselines and hide loader.
+        mv.addEventListener('seeked', function () {
+            mainErrorCount = 0;
+            clearMainStallTimer();
+            markMainProgressBaseline();
+            if (mv && !isNaN(mv.currentTime) && isFinite(mv.currentTime)) {
+                sttvStallBestCt = mv.currentTime;
+                sttvStallSince = 0;
+                sttvStallLastCt = -1;
+                sttvStallSeeks = 0;
+            }
+            setMainLoading(false);
+        });
         // waiting: playback stalled (buffer underrun). Show loader unless user-paused.
         mv.addEventListener('waiting', function () {
             if (isVideoPausedByUser(mv)) {
@@ -1723,6 +1736,420 @@
     // Timeline, Duration & Video Status Utilities
     // =========================================================================
 
+    var mainLiveSessionId = '';
+    var mainLiveMinSeekSeconds = 0;
+    var mainLiveMaxSeekSeconds = 0;
+    var mainLiveMaxUpdatedWallMs = 0;
+    var mainLiveHealthLastPollMs = 0;
+    var LIVE_SEEK_TIMERS = [5, 10, 30, 60, 120, 300, 600, 900, 1200, 1800, 3600];
+    var LIVE_SEEK_LABELS = [
+        '5 seconds',
+        '10 seconds',
+        '30 seconds',
+        '1 minute',
+        '2 minutes',
+        '5 minutes',
+        '10 minutes',
+        '15 minutes',
+        '20 minutes',
+        '30 minutes',
+        '1 hour'
+    ];
+    var LIVE_SEEK_RAMPS = [300, 500, 1000, 1500, 2000];
+    var liveJumpState = {
+        active: false,
+        addToJump: 0,
+        timeToJump: 0,
+        jumpCount: 0,
+        oldTime: 0,
+        lockStep: false,
+        lastSignal: '',
+        sizeClearTimerId: 0,
+        sizeClearTimerId2: 0
+    };
+    var liveKeyHooksInstalled = false;
+    var liveTempHiddenChatEl = null;
+    var liveWasProgressBarFocused = false;
+
+    function resetLiveJumpState() {
+        if (liveJumpState.sizeClearTimerId) {
+            w.clearTimeout(liveJumpState.sizeClearTimerId);
+            liveJumpState.sizeClearTimerId = 0;
+        }
+        if (liveJumpState.sizeClearTimerId2) {
+            w.clearTimeout(liveJumpState.sizeClearTimerId2);
+            liveJumpState.sizeClearTimerId2 = 0;
+        }
+        liveJumpState.active = false;
+        liveJumpState.addToJump = 0;
+        liveJumpState.timeToJump = 0;
+        liveJumpState.jumpCount = getLiveSeekMinIndex();
+        liveJumpState.oldTime = 0;
+        liveJumpState.lockStep = false;
+        liveJumpState.lastSignal = '';
+    }
+
+    function resetMainLiveTimelineState() {
+        mainLiveSessionId = '';
+        mainLiveMinSeekSeconds = 0;
+        mainLiveMaxSeekSeconds = 0;
+        mainLiveMaxUpdatedWallMs = 0;
+        resetLiveJumpState();
+    }
+
+    function parseLiveHealthResponse(text) {
+        if (!text || typeof text !== 'string') return;
+        var braceIdx = text.indexOf('{');
+        if (braceIdx === -1) return;
+        try {
+            var data = JSON.parse(text.substring(braceIdx));
+            if (!data || typeof data !== 'object') return;
+            var sess = data.sess ? String(data.sess) : '';
+            if (sess && sess !== mainLiveSessionId) {
+                mainLiveSessionId = sess;
+                mainLiveMinSeekSeconds = 0;
+                mainLiveMaxSeekSeconds = 0;
+            }
+            if (typeof data.minSec === 'number' && isFinite(data.minSec) && data.minSec >= 0) {
+                mainLiveMinSeekSeconds = data.minSec;
+            }
+            if (typeof data.maxSec === 'number' && isFinite(data.maxSec) && data.maxSec > 0) {
+                mainLiveMaxSeekSeconds = data.maxSec;
+                mainLiveMaxUpdatedWallMs = Date.now();
+            }
+        } catch (e) {}
+    }
+
+    function pollLiveHealthWindow(force) {
+        var now = Date.now();
+        if (!force && now - mainLiveHealthLastPollMs < 1500) return;
+        mainLiveHealthLastPollMs = now;
+        try {
+            var xhr = new XMLHttpRequest();
+            xhr.open('GET', REMUX_BASE + '/health', true);
+            xhr.timeout = 2000;
+            xhr.onload = function () {
+                if (xhr.status === 200 && xhr.responseText) {
+                    parseLiveHealthResponse(xhr.responseText);
+                }
+            };
+            xhr.send();
+        } catch (e) {}
+    }
+
+    function getLiveStreamDurationMs(video, positionMs) {
+        var now = Date.now();
+        if (isMainActive() && isLiveStreamState(ms) && now - mainLiveHealthLastPollMs >= 2000) {
+            pollLiveHealthWindow(false);
+        }
+        var maxSec = mainLiveMaxSeekSeconds;
+        if (maxSec > 0 && mainLiveMaxUpdatedWallMs > 0 && now > mainLiveMaxUpdatedWallMs) {
+            maxSec += Math.min(10, (now - mainLiveMaxUpdatedWallMs) / 1000);
+        }
+        var bufEnd = getBufferedEndSeconds(video);
+        var posSec = positionMs > 0 ? positionMs / 1000 : 0;
+        var durSec = Math.max(maxSec, bufEnd, posSec + 1, 12);
+        if (durSec > 3599) durSec = 3599;
+        return Math.floor(durSec * 1000);
+    }
+
+    function getLiveSeekMinIndex() {
+        try {
+            if (w.Settings_value && w.Settings_value.vod_seek_min) {
+                var v = parseInt(w.Settings_value.vod_seek_min.defaultValue, 10);
+                if (isFinite(v)) return clamp(v, 0, LIVE_SEEK_TIMERS.length - 1);
+            }
+        } catch (e) {}
+        return 0;
+    }
+
+    function getLiveSeekMaxIndex() {
+        try {
+            if (w.Settings_value && w.Settings_value.vod_seek_max) {
+                var v = parseInt(w.Settings_value.vod_seek_max.defaultValue, 10);
+                if (isFinite(v)) return clamp(v, 0, LIVE_SEEK_TIMERS.length - 1);
+            }
+        } catch (e) {}
+        return LIVE_SEEK_TIMERS.length - 1;
+    }
+
+    function getLiveSeekRampMs() {
+        try {
+            if (w.Settings_value && w.Settings_value.vod_seek_time) {
+                var idx = parseInt(w.Settings_value.vod_seek_time.defaultValue, 10);
+                if (isFinite(idx)) return LIVE_SEEK_RAMPS[clamp(idx, 0, LIVE_SEEK_RAMPS.length - 1)];
+            }
+        } catch (e) {}
+        return 1000;
+    }
+
+    function formatLiveTimeS(time) {
+        var t = Math.round(Math.max(0, parseFloat(time) || 0));
+        var seconds = t % 60;
+        t = Math.floor(t / 60);
+        var minutes = t % 60;
+        t = Math.floor(t / 60);
+        var hours = t;
+        var ss = seconds < 10 ? '0' + seconds : String(seconds);
+        var mm = minutes < 10 ? '0' + minutes : String(minutes);
+        var hh = hours < 10 ? '0' + hours : String(hours);
+        return !hours ? mm + ':' + ss : hh + ':' + mm + ':' + ss;
+    }
+
+    function hasDomClass(el, cls) {
+        if (!el || typeof el.className !== 'string') return false;
+        return (' ' + el.className + ' ').indexOf(' ' + cls + ' ') !== -1;
+    }
+
+    function isLivePanelShowing() {
+        if (!w.document) return false;
+        var panel = w.document.getElementById('scene_channel_panel');
+        if (!panel || !panel.style) return false;
+        return (parseInt(panel.style.opacity, 10) || 0) > 0;
+    }
+
+    function isLiveProgressBarFocused() {
+        if (!w.document) return false;
+        var pb = w.document.getElementById('progress_bar_div');
+        return hasDomClass(pb, 'progress_bar_div_focus');
+    }
+
+    function liveRenderJumpTime(durationSec) {
+        if (!w.document) return;
+        var dur = durationSec > 0 ? durationSec : Math.max(1, getMainDurationMs() / 1000);
+        var jumpEl = w.document.getElementById('progress_bar_jump_to');
+        var barEl = w.document.getElementById('inner_progress_bar');
+        var jumpStr = formatLiveTimeS(liveJumpState.timeToJump);
+        if (jumpEl) {
+            jumpEl.textContent =
+                'Jumping (' +
+                (liveJumpState.addToJump < 0 ? '-' : '') +
+                formatLiveTimeS(Math.abs(liveJumpState.addToJump)) +
+                ') to ' +
+                jumpStr;
+        }
+        if (barEl && barEl.style) {
+            var ratio = dur > 0 ? liveJumpState.timeToJump / dur : 0;
+            var xOffset = Math.min(Math.max(-98.9 + ratio * 100, -98.9), -0.5);
+            barEl.style.transition = 'none';
+            barEl.style.transform = 'translate(' + xOffset + '%, -27%)';
+        }
+    }
+
+    function liveRenderJumpSteps() {
+        if (!w.document) return;
+        var stepsEl = w.document.getElementById('progress_bar_steps');
+        if (!stepsEl) return;
+        var pos = clamp(liveJumpState.jumpCount, 0, LIVE_SEEK_LABELS.length - 1);
+        var label = LIVE_SEEK_LABELS[pos];
+        try {
+            if (w.Settings_value && w.Settings_value.vod_seek_min && w.Settings_value.vod_seek_min.values && w.Settings_value.vod_seek_min.values[pos]) {
+                label = w.Settings_value.vod_seek_min.values[pos];
+            }
+        } catch (e) {}
+        if (liveJumpState.addToJump !== 0 && isLiveProgressBarFocused()) {
+            stepsEl.style.display = 'inline-block';
+        }
+        var lockText = liveJumpState.lockStep ? 'locked press up to change' : 'press up to lock the step value';
+        stepsEl.innerHTML = 'Jump step ' + (liveJumpState.lastSignal || '') + label + '<br>' + lockText;
+    }
+
+    function liveJumpSizeClear() {
+        liveJumpState.sizeClearTimerId = 0;
+        liveJumpState.sizeClearTimerId2 = 0;
+        if (!liveJumpState.active || !isLiveStreamState(ms)) return;
+        liveJumpState.jumpCount = getLiveSeekMinIndex();
+        liveJumpState.oldTime = 0;
+        liveJumpState.lastSignal = '';
+        liveRenderJumpSteps();
+    }
+
+    function liveJumpStart(multiplier) {
+        if (!isMainActive() || !isLiveStreamState(ms)) return;
+        pollLiveHealthWindow(false);
+        if (liveJumpState.sizeClearTimerId) {
+            w.clearTimeout(liveJumpState.sizeClearTimerId);
+            liveJumpState.sizeClearTimerId = 0;
+        }
+        if (liveJumpState.sizeClearTimerId2) {
+            w.clearTimeout(liveJumpState.sizeClearTimerId2);
+            liveJumpState.sizeClearTimerId2 = 0;
+        }
+        var currentSec = getMainCurrentTimeMs() / 1000;
+        var durationSec = Math.max(1, getMainDurationMs() / 1000);
+        if (!liveJumpState.active) {
+            liveJumpState.active = true;
+            liveJumpState.addToJump = 0;
+            liveJumpState.jumpCount = getLiveSeekMinIndex();
+            liveJumpState.oldTime = 0;
+            liveJumpState.lockStep = false;
+        }
+        var now = Date.now();
+        var maxStep = getLiveSeekMaxIndex();
+        if (!liveJumpState.lockStep && liveJumpState.jumpCount < maxStep && liveJumpState.oldTime > 0 && now > liveJumpState.oldTime) {
+            liveJumpState.jumpCount++;
+            liveJumpState.oldTime = now + getLiveSeekRampMs();
+        } else if (!liveJumpState.oldTime) {
+            liveJumpState.oldTime = now + getLiveSeekRampMs();
+        }
+        var stepSec = LIVE_SEEK_TIMERS[clamp(liveJumpState.jumpCount, 0, LIVE_SEEK_TIMERS.length - 1)] || 5;
+        liveJumpState.addToJump += stepSec * multiplier;
+        liveJumpState.timeToJump = currentSec + liveJumpState.addToJump;
+        var minSeekSec = Math.max(0, Math.min(mainLiveMinSeekSeconds, Math.max(0, currentSec - 2)));
+        var maxSeekSec = Math.max(minSeekSec, durationSec - 1);
+        if (liveJumpState.timeToJump > maxSeekSec) {
+            liveJumpState.timeToJump = maxSeekSec;
+            liveJumpState.addToJump = liveJumpState.timeToJump - currentSec;
+            liveJumpState.oldTime = 0;
+            if (!liveJumpState.lockStep) liveJumpState.jumpCount = getLiveSeekMinIndex();
+        } else if (liveJumpState.timeToJump < minSeekSec) {
+            liveJumpState.timeToJump = minSeekSec;
+            liveJumpState.addToJump = liveJumpState.timeToJump - currentSec;
+            liveJumpState.oldTime = 0;
+            if (!liveJumpState.lockStep) liveJumpState.jumpCount = getLiveSeekMinIndex();
+        }
+        liveJumpState.lastSignal = multiplier < 0 ? '-' : '';
+        liveRenderJumpTime(durationSec);
+        liveRenderJumpSteps();
+        if (!liveJumpState.lockStep) {
+            liveJumpState.sizeClearTimerId = w.setTimeout(liveJumpSizeClear, 1002);
+            liveJumpState.sizeClearTimerId2 = w.setTimeout(liveJumpSizeClear, 1025);
+        }
+    }
+
+    function liveJumpStepsIncrease() {
+        if (!isMainActive() || !isLiveStreamState(ms) || !liveJumpState.active) return;
+        if (liveJumpState.sizeClearTimerId) {
+            w.clearTimeout(liveJumpState.sizeClearTimerId);
+            liveJumpState.sizeClearTimerId = 0;
+        }
+        if (liveJumpState.sizeClearTimerId2) {
+            w.clearTimeout(liveJumpState.sizeClearTimerId2);
+            liveJumpState.sizeClearTimerId2 = 0;
+        }
+        if (liveJumpState.lockStep) {
+            if (liveJumpState.jumpCount < LIVE_SEEK_TIMERS.length - 1) {
+                liveJumpState.jumpCount++;
+            } else {
+                liveJumpState.jumpCount = 0;
+            }
+        }
+        liveJumpState.lockStep = true;
+        liveRenderJumpSteps();
+    }
+
+    function syncLiveProgressBarUi(positionMs, durationMs) {
+        if (!w.document || !isMainActive() || !isLiveStreamState(ms)) return;
+        var curSec = Math.max(0, (positionMs > 0 ? positionMs : getMainCurrentTimeMs()) / 1000);
+        var durSec = Math.max(1, (durationMs > 0 ? durationMs : getMainDurationMs()) / 1000);
+        var durEl = w.document.getElementById('progress_bar_duration');
+        if (durEl && durSec > 0) {
+            durEl.textContent = formatLiveTimeS(durSec);
+        }
+        var stepsEl = w.document.getElementById('progress_bar_steps');
+        if (liveJumpState.active) {
+            if (!isLivePanelShowing() || (stepsEl && stepsEl.style && stepsEl.style.display === 'none' && !isLiveProgressBarFocused())) {
+                resetLiveJumpState();
+            } else if (isLiveProgressBarFocused()) {
+                liveRenderJumpTime(durSec);
+                liveRenderJumpSteps();
+                return;
+            }
+        }
+        var jumpEl = w.document.getElementById('progress_bar_jump_to');
+        if (jumpEl) {
+            jumpEl.textContent = 'Remaining: ' + formatLiveTimeS(Math.max(0, durSec - curSec));
+        }
+    }
+
+    function applyLiveSeekImmediateDomUpdate(seekSec, durSec) {
+        if (!w.document) return;
+        var ctEl = w.document.getElementById('progress_bar_current_time');
+        var durEl = w.document.getElementById('progress_bar_duration');
+        var barEl = w.document.getElementById('inner_progress_bar');
+        var jumpEl = w.document.getElementById('progress_bar_jump_to');
+        var stepsEl = w.document.getElementById('progress_bar_steps');
+        if (ctEl) ctEl.textContent = formatLiveTimeS(seekSec);
+        if (durEl && durSec > 0) durEl.textContent = formatLiveTimeS(durSec);
+        if (barEl && barEl.style && durSec > 0) {
+            var xOffset = Math.min(Math.max(-98.9 + (seekSec / durSec) * 100, -98.9), -0.5);
+            barEl.style.transition = '';
+            barEl.style.transform = 'translate(' + xOffset + '%, -27%)';
+        }
+        if (jumpEl) {
+            jumpEl.textContent = 'Remaining: ' + formatLiveTimeS(Math.max(0, durSec - seekSec));
+        }
+        if (stepsEl && stepsEl.style) {
+            stepsEl.style.display = 'none';
+        }
+    }
+
+    function installLiveSeekKeyHooks() {
+        if (liveKeyHooksInstalled || !w.document || typeof w.document.addEventListener !== 'function') return;
+        liveKeyHooksInstalled = true;
+        w.document.addEventListener(
+            'keydown',
+            function (e) {
+                liveTempHiddenChatEl = null;
+                liveWasProgressBarFocused = false;
+                if (!e || !isMainActive() || !isLiveStreamState(ms)) return;
+                var code = e.keyCode || e.which || 0;
+                liveWasProgressBarFocused = isLiveProgressBarFocused();
+                if ((code === 37 || code === 39) && !isLivePanelShowing()) {
+                    var endDlg = w.document.getElementById('dialog_end_stream');
+                    if (endDlg && !hasDomClass(endDlg, 'hide')) return;
+                    var chatEl = w.document.getElementById('chat_container0');
+                    if (chatEl && !hasDomClass(chatEl, 'hide')) {
+                        liveTempHiddenChatEl = chatEl;
+                        chatEl.className = (chatEl.className ? chatEl.className + ' ' : '') + 'hide';
+                    }
+                }
+            },
+            true
+        );
+        w.document.addEventListener(
+            'keydown',
+            function (e) {
+                if (liveTempHiddenChatEl) {
+                    liveTempHiddenChatEl.className = String(liveTempHiddenChatEl.className || '')
+                        .replace(/(?:^|\s)hide(?!\S)/g, '')
+                        .replace(/^\s+|\s+$/g, '');
+                    liveTempHiddenChatEl = null;
+                }
+                if (!e || !isMainActive() || !isLiveStreamState(ms)) return;
+                var code = e.keyCode || e.which || 0;
+                if (!isLivePanelShowing()) {
+                    if (liveJumpState.active) resetLiveJumpState();
+                    return;
+                }
+                if (code === 37 && isLiveProgressBarFocused()) {
+                    liveJumpStart(-1);
+                } else if (code === 39 && isLiveProgressBarFocused()) {
+                    liveJumpStart(1);
+                } else if (code === 38 && isLiveProgressBarFocused()) {
+                    if (liveWasProgressBarFocused && liveJumpState.active) {
+                        liveJumpStepsIncrease();
+                    } else if (!liveWasProgressBarFocused && liveJumpState.active && liveJumpState.addToJump !== 0) {
+                        liveRenderJumpTime(Math.max(1, getMainDurationMs() / 1000));
+                        liveRenderJumpSteps();
+                    }
+                } else {
+                    syncLiveProgressBarUi(0, 0);
+                }
+            },
+            false
+        );
+        w.document.addEventListener(
+            'keyup',
+            function () {
+                if (liveJumpState.active) {
+                    liveJumpState.oldTime = 0;
+                }
+            },
+            false
+        );
+    }
+
     // Reads duration, position, and seekable window from a video element.
     // Returns a reusable object (no per-call allocation) to reduce GC pressure.
     // Android: ExoPlayer provides these via Player.getDuration()/getCurrentPosition().
@@ -1751,6 +2178,9 @@
         var currentSeconds = parseFloat(video.currentTime);
         if (isFinite(currentSeconds) && currentSeconds > 0) {
             out.positionMs = Math.floor(currentSeconds * 1000);
+        }
+        if (isLiveMain) {
+            out.durationMs = getLiveStreamDurationMs(video, out.positionMs);
         }
         if (!isLiveMain && out.durationMs <= 0) {
             try {
@@ -1834,6 +2264,9 @@
     // Android: ExoPlayer provides this natively. webOS: estimated from seekable window.
     function getCurrentLiveOffsetMs(video, durationMs, positionMs, previewPath) {
         if (!video) return 0;
+        if (!previewPath && video === mv && isLiveStreamState(ms) && durationMs > 0) {
+            return smoothLiveOffsetMs(Math.max(2000, durationMs - positionMs + 2000), false);
+        }
         var liveOffsetMs = 0;
         try {
             if (video.seekable && video.seekable.length > 0) {
@@ -2077,11 +2510,23 @@
         var duration = timeline.durationMs > 0 ? timeline.durationMs : getMainDurationMs();
         if (duration > 0 && jumpPosition >= duration) jumpPosition = Math.max(0, duration - 1000);
         var seekSeconds = jumpPosition / 1000;
-        if (timeline.useSeekableWindow && isFinite(timeline.seekStartSeconds) && isFinite(timeline.seekEndSeconds) && timeline.seekEndSeconds > timeline.seekStartSeconds) {
+        if (isLiveStreamState(ms)) {
+            var currentSec = !isNaN(mv.currentTime) && isFinite(mv.currentTime) ? mv.currentTime : 0;
+            var minSeek = Math.max(0, Math.min(mainLiveMinSeekSeconds, Math.max(0, currentSec - 2)));
+            var maxSeek = duration > 0 ? Math.max(minSeek, duration / 1000 - 1) : seekSeconds;
+            if (seekSeconds < minSeek) seekSeconds = minSeek;
+            if (seekSeconds > maxSeek) seekSeconds = maxSeek;
+        } else if (timeline.useSeekableWindow && isFinite(timeline.seekStartSeconds) && isFinite(timeline.seekEndSeconds) && timeline.seekEndSeconds > timeline.seekStartSeconds) {
             seekSeconds = timeline.seekStartSeconds + seekSeconds;
             if (seekSeconds > timeline.seekEndSeconds) seekSeconds = timeline.seekEndSeconds;
             if (seekSeconds < timeline.seekStartSeconds) seekSeconds = timeline.seekStartSeconds;
         }
+        sttvStallBestCt = seekSeconds;
+        sttvStallSince = 0;
+        sttvStallLastCt = -1;
+        sttvStallSeeks = 0;
+        mainLastCurrentTime = seekSeconds;
+        mainLastProgressWallMs = Date.now();
         tryPlay(mv);
         try {
             mv.currentTime = seekSeconds;
@@ -2636,6 +3081,7 @@
         ms.resume = 0;
         mainDurationMsCached = 0;
         liveLatencyOffsetMainMs = 0;
+        resetMainLiveTimelineState();
     }
     function resetPreviewState() {
         ps.type = 1;
@@ -2666,6 +3112,7 @@
         clearMainStallTimer();
         mainErrorCount = 0;
         resetMainRecoveryState();
+        resetMainLiveTimelineState();
         requestMainLoadingShow();
         ms.type = t || 1;
         ms.rawUri = limitUsherCodecs(u || '');
@@ -3314,8 +3761,10 @@
                 x.timeout = 2500;
                 x.onload = function () {
                     if (settled) return;
-                    if (x.status === 200 && String(x.responseText || '').indexOf('ok') !== -1) finish('');
-                    else retry('health_status_' + x.status);
+                    if (x.status === 200 && String(x.responseText || '').indexOf('ok') !== -1) {
+                        parseLiveHealthResponse(x.responseText);
+                        finish('');
+                    } else retry('health_status_' + x.status);
                 };
                 x.onerror = function () { retry('health_unreachable'); };
                 x.ontimeout = function () { retry('health_timeout'); };
@@ -3451,7 +3900,11 @@
                 if (sttvHeartbeatTimerId === -1) return; // closing: do not restart
                 ensureSttvServe();
             };
-            xhr.onload = function () {};
+            xhr.onload = function () {
+                if (xhr.status === 200 && xhr.responseText) {
+                    parseLiveHealthResponse(xhr.responseText);
+                }
+            };
             xhr.onerror = onFail;
             xhr.ontimeout = onFail;
             xhr.send();
@@ -3502,8 +3955,13 @@
             // Jitter-proof stall clock (whole seconds).
             var key = Math.floor(ct);
             if (key !== sttvStallLastCt) {
+                if (sttvStallLastCt >= 0 && key > sttvStallLastCt) {
+                    sttvStallSince = 0;
+                    sttvStallSeeks = 0;
+                } else if (!sttvStallSince) {
+                    sttvStallSince = Date.now();
+                }
                 sttvStallLastCt = key;
-                if (!sttvStallSince) sttvStallSince = Date.now();
                 return;
             }
             if (key <= 0) return;
@@ -3516,9 +3974,10 @@
             // Gap-buster: ONE attempt per stall episode only (each seek renders
             // as frame+spinner; the restart is the real recovery) and only on
             // genuine stasis with the frontier signature - never during normal
-            // frontier-riding play.
+            // frontier-riding play. On webOS 3.4 native HLS, v.buffered reports
+            // a static dummy range [0, 2] which must never trigger a gap-seek to 0.
             var be = v.buffered && v.buffered.length ? v.buffered.end(v.buffered.length - 1) : -1;
-            if (elapsed >= 10000 && be >= 0 && ct > be + 0.5 && now - sttvStallLastSeek >= 6000 && sttvStallSeeks < 1) {
+            if (mseActive() && !v.seeking && elapsed >= 10000 && be >= 0 && ct > be + 0.5 && now - sttvStallLastSeek >= 6000 && sttvStallSeeks < 1) {
                 sttvStallLastSeek = now;
                 sttvStallSeeks++;
                 var target = Math.max(0, be - 3);
@@ -6560,6 +7019,14 @@
         A.gettimepreview = function () { return getPreviewCurrentTimeMs(); };
         // IMPLEMENTED: Seeks main player to position in milliseconds and persists resume for VOD/clip types.
         A.mseekTo = function (pos) {
+            if (isLiveStreamState(ms) && liveJumpState.active) {
+                var liveTargetSec = Math.max(0, liveJumpState.timeToJump);
+                var liveDurSec = Math.max(1, getMainDurationMs() / 1000);
+                resetLiveJumpState();
+                seekMainToMs(Math.round(liveTargetSec * 1000));
+                applyLiveSeekImmediateDomUpdate(liveTargetSec, liveDurSec);
+                return;
+            }
             var positionMs = Math.max(0, parseInt(pos, 10) || 0);
             seekMainToMs(positionMs);
             if (ms.type === 2 || ms.type === 3) ms.resume = positionMs;
@@ -6596,6 +7063,7 @@
         A.getDuration = function (cb) {
             var d = getMainDurationMs();
             call(cb, [d]);
+            if (isLiveStreamState(ms)) syncLiveProgressBarUi(0, d);
         };
         // IMPLEMENTED: Emits screen-duration update payload used by upstream progress UI.
         A.updateScreenDuration = function (cb, key, objId) {
@@ -6608,6 +7076,7 @@
             var whoCalled = parseInt(wc, 10) || 0;
             var payload = buildVideoStatusPayload(showLatency, mv, false);
             call('Play_ShowVideoStatus', [showLatency, whoCalled, JSON.stringify(payload)]);
+            if (isLiveStreamState(ms)) syncLiveProgressBarUi(payload[9], payload[8]);
         };
         // IMPLEMENTED: Returns currently selected quality label (or Auto).
         A.getVideoQuality = function (wc) { var v = ms.qp >= 0 && ms.q[ms.qp] ? ms.q[ms.qp].id : 'Auto'; call('Play_ShowVideoQuality', [wc, v]); };
@@ -6904,6 +7373,7 @@
     // 10) Harden scene transitions and start player-scene optimizer.
     installSceneSafetyPatches();
     installPlayerSceneOptimizerMonitor();
+    installLiveSeekKeyHooks();
     // 11) Start periodic version checks.
     checkForkVersionAndRefresh();
     versionRefreshIntervalId = w.setInterval(checkForkVersionAndRefresh, VERSION_REFRESH_MIN_INTERVAL_MS);
