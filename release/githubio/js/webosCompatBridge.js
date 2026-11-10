@@ -1234,15 +1234,21 @@
         return false;
     }
     // Stops playback if app has been hidden long enough. Called from delayed timer.
-    function tryLifecycleStop() {
-        if (!shouldLifecycleHandle()) return;
+    function tryLifecycleStop(immediate) {
+        if (!shouldLifecycleHandle()) {
+            try { clear(mv); } catch (e1) {}
+            try { clear(pv); } catch (e2) {}
+            return;
+        }
         if (lifecycleSuspended) return;
-        if (!isDocumentHiddenNow()) return;
-        if (lifecycleHiddenSinceAt > 0 && Date.now() - lifecycleHiddenSinceAt < LIFECYCLE_STOP_MIN_HIDDEN_MS) {
+        if (!immediate && !isDocumentHiddenNow()) return;
+        if (!immediate && lifecycleHiddenSinceAt > 0 && Date.now() - lifecycleHiddenSinceAt < LIFECYCLE_STOP_MIN_HIDDEN_MS) {
             scheduleLifecycleStop(LIFECYCLE_STOP_MIN_HIDDEN_MS - (Date.now() - lifecycleHiddenSinceAt));
             return;
         }
         if (call('Main_CheckStop') !== null) lifecycleSuspended = true;
+        try { clear(mv); } catch (e3) {}
+        try { clear(pv); } catch (e4) {}
     }
     // Resumes playback after app returns to foreground.
     function tryLifecycleResume() {
@@ -1312,7 +1318,7 @@
             if (hidden) {
                 if (!lifecycleHiddenSinceAt) lifecycleHiddenSinceAt = Date.now();
                 if (versionRefreshIntervalId) { w.clearInterval(versionRefreshIntervalId); versionRefreshIntervalId = 0; }
-                scheduleLifecycleStop(LIFECYCLE_STOP_MIN_HIDDEN_MS);
+                tryLifecycleStop(true);
             }
             else if (
                 w.document.visibilityState === 'visible' ||
@@ -1326,6 +1332,24 @@
         };
         w.document.addEventListener('visibilitychange', onVisibilityChange, true);
         w.document.addEventListener('webkitvisibilitychange', onVisibilityChange, true);
+        w.addEventListener('pagehide', function () { tryLifecycleStop(true); }, true);
+        w.addEventListener('beforeunload', function () { tryLifecycleStop(true); }, true);
+        w.addEventListener('unload', function () { tryLifecycleStop(true); }, true);
+
+        // webOS system state changes
+        w.document.addEventListener('webOSStateChange', function (e) {
+            var state = e && e.detail && e.detail.state;
+            if (state === 'suspend' || state === 'hidden') {
+                tryLifecycleStop(true);
+            } else if (state === 'active' || state === 'visible') {
+                tryLifecycleResume();
+            }
+        }, true);
+
+        w.document.addEventListener('webOSRelaunch', function () {
+            tryLifecycleResume();
+        }, true);
+
         w.addEventListener(
             'pageshow',
             function () {
