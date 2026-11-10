@@ -197,55 +197,101 @@ start by themselves (no need to open the Homebrew Channel manually), while the
 SmartTwitch app itself does **not** auto-launch (keeps TV performance) and the
 local remux server runs **only while the app is open**.
 
-1. Persistent webOS activity `com.tbsniller.smarttwitchwebostv.boot`
-   (created via `luna://com.webos.service.activitymanager/create`, callback
-   `com.webos.applicationManager/launch` of the wrapper with
-   `params: {sttv_boot_kick: 1}` — stock-public, so the activity manager's
-   rights check passes. Homebrew's `org.webosbrew.hbchannel.service/autostart`
-   **cannot** be an activity callback: `errorCode:13 "Activity creator doesn't
-   have rights to call its callback"`, tested. The app's group membership lives
-   in `/var/luna-service2/client-permissions.d/com.tbsniller.smarttwitchwebostv.app.json`.)
-   It fires on `bootManager core-boot-done`.
-2. The wrapper (`webos/app/index.js`) branches on the launch params:
-   - **`sttv_boot_kick` present** (boot activity): kick
-     `org.webosbrew.hbchannel.service/autostart` (runs
-     `/var/lib/webosbrew/startup.sh` as root: dropbear + telnetd +
-     `run-parts /var/lib/webosbrew/init.d`). The kick is retried on service
-     error (2.5/5/7.5s, up to 4 attempts) because at `core-boot-done` the
-     Homebrew service may not be registered yet - a single fire-and-forget
-     kick was observed to be lost (boot with no dropbear). The window closes
-     itself as soon as the kick is acknowledged (12s absolute cap) via
-     `applicationManager/close` (sent twice) plus a `window.close()` fallback
-     (the only close mechanism this TV accepts; the luna `close` method
-     rejects `{id}`/`appId` here). No navigation, no server, no SmartTwitch
-     left running - the wrapper window exists only for the moments of the
-     kick.
-   - **normal manual launch**: kick + `ensureSttvServe()` + install the launch
-     handlers that navigate to the hosted app.
-3. **sttv_serve lifecycle — starts with the app, stops when it closes**
-   (source: `tools/tv-serve.js`):
-   - *start*: wrapper `ensureSttvServe()` on manual open and bridge bootstrap
-     (`hb exec`: `pgrep -f sttv_serve.js || nohup node sttv_serve.js 8099` —
-     idempotent). Never started by the boot chain; `99-sttv-serve` was removed
-     from `webos/homebrew/` and from the TV's `/var/lib/webosbrew/init.d/`.
-   - *stop*: bridge `pagehide`/`beforeunload` → `pkill -f sttv_serve.js`
-     (immediate when unload fires), **plus a heartbeat** as the reliable path:
-     the bridge pings `/health` every 10s while the page is alive and the
-     server exits after 90s without any request — so even a webOS process kill
-     (which does not reliably fire unload events) stops it within ~90s.
-   - *self-heal*: a failed heartbeat re-ensures the server (it may have
-     self-stopped while the page was suspended), and becoming visible again
-     re-ensures it too; active playback requests also keep it alive.
+### SmartTwitch must not auto-launch
 
-Verified end-to-end on the TV (2026-11-06): boot with no manual action ->
-`/tmp/webosbrew_startup` written ~30s in, ports 22+23 up, port 8099 down,
-`init.d` empty, `/json` shows no SmartTwitch target (wrapper self-closed);
-manual open -> server up; app close -> server stopped ~70s later via the
-heartbeat (unload hooks did not fire on this close).
+An earlier SSH-bootstrap step created a *persistent* webOS activity
+`com.tbsniller.smarttwitchwebostv.boot` (activityId **111**) whose callback
+launched the wrapper with `sttv_boot_kick: 1`. It fired on `core-boot-done` at
+every boot, so each boot flashed the SmartTwitch splash and then fell back to
+live TV. It has been **cancelled** and does not come back:
+
+```
+luna-send -n 1 luna://com.palm.activitymanager/cancel '{"activityId":111}'
+```
+
+Verified across a full reboot: `grep -ac 'NL_APP_LAUNCH_BEGIN.*smarttwitchwebostv'
+/var/log/messages` -> `0`, and no `NL_APP_LAUNCH` entry for
+`com.tbsniller.smarttwitchwebostv` at all. The wrapper's `sttv_boot_kick`
+branch (`webos/app/index.js`) is now dormant — nothing launches the wrapper
+with that param any more — and is kept only as an inert fallback.
+
+### ssh + telnet: Homebrew's own boot activity + a 5-minute retry
+
+`/var/lib/webosbrew/startup.sh` is what starts dropbear + telnetd and runs
+`run-parts /var/lib/webosbrew/init.d` (which includes `90_root_password_bind`).
+Homebrew Channel already intends to invoke it from a persistent activity, so
+the boot chain reuses that instead of inventing a second one:
+
+- activity `org.webosbrew.hbchannel.service.autostart`, **created as the
+  Homebrew service identity**:
+  `luna-send -a org.webosbrew.hbchannel.service -n 1
+  luna://com.palm.activitymanager/create '{...}'`. Creating it from the shell
+  identity fails with `errorCode:13 "Activity creator doesn't have rights to
+  call its callback"`.
+- `type: {foreground: true, persist: true, continuous: true}`; `trigger` =
+  `palm://com.webos.bootManager/getBootStatus` (`subscribe: true`) with
+  `where: {prop: ["signals","core-boot-done"], op: "=", val: true}`;
+  `schedule: {interval: "5m", local: true}`; `callback` =
+  `palm://org.webosbrew.hbchannel.service/autostart`.
+- create quirks found by testing: `start: true` **and** a callback are
+  mandatory (`errorCode:22` otherwise), `foreground` must be `true` when
+  present (`errorCode:12`), and `schedule.interval` only accepts
+  `1d … 12h, 6h, 3h, 1h, 20m, 30m, 15m, 10m, 5m`.
+- **why both trigger and schedule**: `core-boot-done` lands at ~25.4s
+  (`/var/log/bootd.log`), which is before the Homebrew service is guaranteed
+  to be usable — `elevate-service`, the root elevation, is only executed by
+  `startup.sh` itself — so a single fire-and-forget kick at that point is racy
+  and was observed to be lost (a boot with no dropbear). The `5m` schedule is
+  the reliable path: it re-arms the same callback until `/tmp/webosbrew_startup`
+  exists, i.e. until `startup.sh` has actually run. The activity definition is
+  persisted in db8 (kind `com.palm.activity:1`, `/var/db/main/*.ldb`) so it is
+  restored on every boot.
+- the callback is idempotent — it answers `"Startup script already executed."`
+  once `/tmp/webosbrew_startup` exists — so extra fires cost nothing.
+
+Verified on the TV (2026-11-08, full reboot): no SmartTwitch launch, no app
+window of any kind, `/tmp/webosbrew_startup` written automatically
+(boot+320s, i.e. the first schedule tick), `dropbear` + `telnetd` running as
+uid 0 with ports 22 and 23 open, `90_root_password_bind` applied
+(`/etc/shadow` bind-mounted from the writable copy), and port 8099 still
+closed — the remux server only exists while the app is open.
+
+### Normal (manual) launch
+
+`launch()` in `webos/app/index.js` branches on the launch params: with
+`sttv_boot_kick` present it only runs `bootKickWithRetry()` (kick
+`org.webosbrew.hbchannel.service/autostart`, then close this window) and never
+navigates — this path is dormant now that activity 111 is cancelled. On a
+normal manual launch it kicks the service, runs `ensureSttvServe()` and
+navigates to the hosted app.
+
+### sttv_serve lifecycle — starts with the app, stops when it closes
+
+Source: `tools/tv-serve.js`.
+
+- *start*: wrapper `ensureSttvServe()` on manual open and bridge bootstrap
+  (`hb exec`: `pgrep -f sttv_serve.js || nohup node sttv_serve.js 8099` —
+  idempotent). Never started by the boot chain; `99-sttv-serve` was removed
+  from `webos/homebrew/` and from the TV's `/var/lib/webosbrew/init.d/`.
+- *stop*: bridge `pagehide`/`beforeunload` → `pkill -f sttv_serve.js`
+  (immediate when unload fires), **plus a heartbeat** as the reliable path:
+  the bridge pings `/health` every 10s while the page is alive and the
+  server exits after 90s without any request — so even a webOS process kill
+  (which does not reliably fire unload events) stops it within ~90s.
+- *self-heal*: a failed heartbeat re-ensures the server (it may have
+  self-stopped while the page was suspended), and becoming visible again
+  re-ensures it too; active playback requests also keep it alive.
+
+Verified end-to-end on the TV (2026-11-08): boot with no manual action ->
+`/tmp/webosbrew_startup` written automatically, ports 22+23 up, port 8099 down,
+no SmartTwitch window; manual open -> server up; app close -> server stopped
+~70s later via the heartbeat (unload hooks did not fire on this close).
 
 Homebrew Channel was upgraded 0.6.3 -> 0.7.3 on this TV (backup:
-`/media/developer/hb_backup_063.tgz`); its service registers the same boot
-activity via `registerActivity` for its own startup.
+`/media/developer/hb_backup_063.tgz`); its service registers the same
+`org.webosbrew.hbchannel.service.autostart` activity via `registerActivity`
+for its own startup — the definition above is the one that activity ends up
+with once `replace: true` has been applied to it.
 
 ## Quality switching (fMP4 VOD)
 
