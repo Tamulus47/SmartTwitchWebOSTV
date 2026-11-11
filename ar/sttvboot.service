@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=com.tbsniller.sttvboot
+Exec=/media/developer/apps/usr/palm/services/org.webosbrew.hbchannel.service/startup.sh
+Type=static
