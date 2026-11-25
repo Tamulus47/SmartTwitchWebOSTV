@@ -1,4 +1,4 @@
-/* Static HTTP server for SmartTwitchWebOSTV testing on webOS (node 0.12, ES5).
+/* Static HTTP server for AncientTwitchWebOSTV testing on webOS (node 0.12, ES5).
  * Document root: /media/developer/sttv_stage
  * Every request is mapped under /SmartTwitchWebOSTV so paths mirror production.
  * Usage: node sttv_serve.js [port]
@@ -119,7 +119,7 @@ function proxyPass(target, res, redirects) {
 var INIT_CACHE_MAX = 8;
 var TS_CACHE_MAX_ITEMS = 150;
 var TS_CACHE_MAX_BYTES = 48 * 1024 * 1024;
-// The server lives only while SmartTwitch is open (started by the wrapper /
+// The server lives only while AncientTwitch is open (started by the wrapper /
 // bridge on app open, stopped on app close). The app page pings /health every
 // 10s while it is alive, so no request for STTV_SERVE_HEARTBEAT_EXIT_MS means
 // the app was closed or killed (webOS process kills do not reliably fire

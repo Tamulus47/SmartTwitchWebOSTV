@@ -1,4 +1,4 @@
-# SmartTwitchTV webOS Port - AI Documentation
+# AncientTwitchWebOSTV - AI Documentation
 
 This document provides AI-oriented architecture context and a documentation map for this fork.
 

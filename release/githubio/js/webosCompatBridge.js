@@ -3876,7 +3876,7 @@
 
     // --- sttv_serve lifecycle: start with the app page, stop on close ------
     // The remux server is intentionally NOT part of the boot chain: it lives
-    // only while SmartTwitch is open - started by the wrapper on a manual
+    // only while AncientTwitch is open - started by the wrapper on a manual
     // app open, re-ensured here after page reloads, and stopped on page
     // teardown (app close) so it never keeps running in the background.
     //
@@ -7408,7 +7408,7 @@
     w.setTimeout(warmUsherPlaylistService, 1000);
     // 14) sttv_serve lifecycle: ensure the local remux server while this app
     //     page lives, and stop it on page teardown (app close) so it does not
-    //     keep running in the background after SmartTwitch is closed.
+    //     keep running in the background after AncientTwitch is closed.
     //     - heartbeat ping every 10s (see sttvServeHeartbeat) lets the server
     //       self-stop when the app is closed/killed even if unload hooks
     //       never fire, and restarts it if it died while we were suspended;

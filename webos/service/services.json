@@ -1,6 +1,6 @@
 {
   "id": "com.tamulus.ancienttwitchwebostv.hls",
-  "description": "SmartTwitchTV local HLS playlist service",
+  "description": "AncientTwitchWebOSTV local HLS playlist service",
   "services": [
     {
       "name": "com.tamulus.ancienttwitchwebostv.hls",

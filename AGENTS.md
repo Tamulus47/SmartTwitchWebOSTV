@@ -6,7 +6,7 @@
 - This repository has multi model/agent support. Always preserve this support.
 
 ## Project Scope
-- This repository is a SmartTwitchTV fork with a webOS wrapper app.
+- This repository is AncientTwitchWebOSTV, a fork of fgl27/SmartTwitchTV with a webOS wrapper app.
 - Primary webOS runtime files are in `webos/app/`.
 - The wrapper loads a hosted release page from this fork.
 - Goal: keep upstream app sources unchanged and implement webOS platform logic in hosted bridge/wrapper only.

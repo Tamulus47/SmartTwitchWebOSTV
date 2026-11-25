@@ -1,4 +1,4 @@
-# SmartTV Twitch WebOS App
+# AncientTwitchWebOSTV
 
 Fork notice: This project exists because of @fgl27 incredible effort in his project [fgl27/SmartTwitchTV](https://github.com/fgl27/SmartTwitchTV). All credits belong to him (and the ones where he forked the project first). 
 
@@ -13,7 +13,7 @@ webOS gaps and Android -> webOS differences:
 ## How to install  
 
 ### Easy way
-Open Homebrew Channel and install SmartTwitchWebOSTV directly from there.  
+Open Homebrew Channel and install AncientTwitchWebOSTV directly from there.  
   
 ### Manual way
 First you will have to [build](https://github.com/Tamulus47/SmartTwitchWebOSTV#development) it from scratch, or download pre-compiled IPK from [releases](https://github.com/Tamulus47/SmartTwitchWebOSTV/releases).  
@@ -61,7 +61,7 @@ luna-send -i -f luna://com.webos.appInstallService/dev/install '{"id":"com.tamul
 
 ## Development
 ### Dependencies
-To build SmartTwitchWebOSTV you will need:  
+To build AncientTwitchWebOSTV you will need:  
 - [Node.js](https://nodejs.org/en/download/)
 
 ### How to build  

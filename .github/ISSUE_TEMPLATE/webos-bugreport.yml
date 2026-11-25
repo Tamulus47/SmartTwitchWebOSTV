@@ -1,12 +1,12 @@
 name: "webOS bug report"
-description: "Report a bug specific to SmartTwitchWebOSTV on LG webOS"
+description: "Report a bug specific to AncientTwitchWebOSTV on LG webOS"
 title: "[webOS bug] "
 labels: ["bug"]
 body:
   - type: markdown
     attributes:
       value: |
-        ⚠️ **ATTENTION:** This repository tracks **LG webOS-specific** player/startup behavior for SmartTwitchTV. This project is NOT actively maintained.
+        ⚠️ **ATTENTION:** This repository tracks **LG webOS-specific** player/startup behavior for AncientTwitchWebOSTV. This project is NOT actively maintained.
 
         If your report is about the core app (non-webOS), please open it in the upstream project:
         https://github.com/fgl27/SmartTwitchTV/issues
@@ -27,7 +27,7 @@ body:
   - type: input
     id: app_version
     attributes:
-      label: SmartTwitchWebOSTV version
+      label: AncientTwitchWebOSTV version
       description: "Tag, release version, or commit SHA (if built locally)."
       placeholder: "vX.Y.Z or commit abc1234"
     validations:
@@ -118,6 +118,6 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for helping improve SmartTwitchWebOSTV.
+        Thanks for helping improve AncientTwitchWebOSTV.
 
             

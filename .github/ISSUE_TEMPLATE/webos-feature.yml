@@ -1,12 +1,12 @@
 name: "webOS feature request"
-description: "Suggest a feature for SmartTwitchWebOSTV webOS integration"
+description: "Suggest a feature for AncientTwitchWebOSTV webOS integration"
 title: "[webOS feature] "
 labels: ["enhancement"]
 body:
   - type: markdown
     attributes:
       value: |
-        ⚠️ **ATTENTION:** This repository is for **LG webOS-specific** SmartTwitchTV integration only. This project is NOT actively maintained.
+        ⚠️ **ATTENTION:** This repository is for **LG webOS-specific** AncientTwitchWebOSTV integration only. This project is NOT actively maintained.
 
         For core app features (non-webOS), please use the upstream project:
         https://github.com/fgl27/SmartTwitchTV/issues
@@ -27,7 +27,7 @@ body:
   - type: input
     id: app_version
     attributes:
-      label: SmartTwitchWebOSTV version
+      label: AncientTwitchWebOSTV version
       description: "Tag, release version, or commit SHA (if built locally)."
       placeholder: "vX.Y.Z or commit abc1234"
     validations:
@@ -96,6 +96,6 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for helping improve SmartTwitchWebOSTV.
+        Thanks for helping improve AncientTwitchWebOSTV.
 
             

@@ -1,7 +1,7 @@
 {
   "name": "com.tamulus.ancienttwitchwebostv.hls",
   "version": "1.0.0",
-  "description": "SmartTwitchTV local HLS playlist service",
+  "description": "AncientTwitchWebOSTV local HLS playlist service",
   "main": "hls_service.js",
   "license": "GPL-3.0-or-later"
 }

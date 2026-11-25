@@ -259,7 +259,7 @@
         }
     }
     // sttv_serve (local fMP4->TS remux server) lifecycle: it must run ONLY
-    // while SmartTwitch is open - started here on a manual app open, stopped
+    // while AncientTwitch is open - started here on a manual app open, stopped
     // by the bridge's unload hook when the app closes, and never started by
     // the boot chain.
     var serveExecBridge = null;
@@ -285,7 +285,7 @@
         }
     }
 
-    // Close this placeholder window (boot kick path): SmartTwitch must not
+    // Close this placeholder window (boot kick path): AncientTwitch must not
     // stay open at boot - it only exists to run the startup kick.
     var selfCloseBridge = null;
     function selfCloseApp() {

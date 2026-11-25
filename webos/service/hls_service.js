@@ -1,5 +1,5 @@
 /*
- * SmartTwitchWebOSTV local webOS JS service for HLS playlist fetches.
+ * AncientTwitchWebOSTV local webOS JS service for HLS playlist fetches.
  * Keeps Twitch playlist fetches inside the app package service process so
  * browser CORS restrictions do not block quality parsing in the hosted app.
  */

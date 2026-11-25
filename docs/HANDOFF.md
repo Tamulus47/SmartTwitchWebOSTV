@@ -1,4 +1,4 @@
-# Handoff — SmartTwitchWebOSTV on the LG webOS 3.4.3 TV
+# Handoff — AncientTwitchWebOSTV on the LG webOS 3.4.3 TV
 
 > Everything a new person needs to know: what the TV is and is not capable of, how the app is
 > put together, what has already been solved, what is still broken, and how to get into the
