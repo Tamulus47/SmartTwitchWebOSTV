@@ -3,7 +3,7 @@ const path = require('path');
 const crypto = require('crypto');
 
 const root = path.resolve(__dirname, '..', '..');
-const sourceRepoUrl = 'https://github.com/TBSniller/SmartTwitchWebOSTV';
+const sourceRepoUrl = 'https://github.com/Tamulus47/SmartTwitchWebOSTV';
 
 function readJson(filePath) {
     if (!fs.existsSync(filePath)) {

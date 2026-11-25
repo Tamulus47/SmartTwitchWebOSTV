@@ -16,14 +16,14 @@ webOS gaps and Android -> webOS differences:
 Open Homebrew Channel and install SmartTwitchWebOSTV directly from there.  
   
 ### Manual way
-First you will have to [build](https://github.com/TBSniller/SmartTwitchWebOSTV#development) it from scratch, or download pre-compiled IPK from [releases](https://github.com/TBSniller/SmartTwitchWebOSTV/releases).  
+First you will have to [build](https://github.com/Tamulus47/SmartTwitchWebOSTV#development) it from scratch, or download pre-compiled IPK from [releases](https://github.com/Tamulus47/SmartTwitchWebOSTV/releases).  
   
 ```
 # Copy IPK to TV 
-scp /home/[USER]/downloads/com.tbsniller.smarttwitchwebostv_[version]_all.ipk root@[TVIP]:/tmp/com.tbsniller.smarttwitchwebostv_[version]_all.ipk
+scp /home/[USER]/downloads/com.tamulus.ancienttwitchwebostv_[version]_all.ipk root@[TVIP]:/tmp/com.tamulus.ancienttwitchwebostv_[version]_all.ipk
 
 # On TV install IPK
-luna-send -i -f luna://com.webos.appInstallService/dev/install '{"id":"com.tbsniller.smarttwitchwebostv","ipkUrl":"/tmp/com.tbsniller.smarttwitchwebostv_[version]_all.ipk","subscribe":true}'
+luna-send -i -f luna://com.webos.appInstallService/dev/install '{"id":"com.tamulus.ancienttwitchwebostv","ipkUrl":"/tmp/com.tamulus.ancienttwitchwebostv_[version]_all.ipk","subscribe":true}'
 ```
 
 ## Fork Overview
@@ -68,7 +68,7 @@ To build SmartTwitchWebOSTV you will need:
 We have tried to make build process as easy as possible. After building all files can be found in `./build`.
 ```
 # Clone project and submodules
-git clone https://github.com/TBSniller/SmartTwitchWebOSTV.git
+git clone https://github.com/Tamulus47/SmartTwitchWebOSTV.git
 cd ./SmartTwitchWebOSTV
 
 # Install node dependencies

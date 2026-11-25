@@ -1,5 +1,5 @@
 {
-  "name": "com.tbsniller.smarttwitchwebostv.hls",
+  "name": "com.tamulus.ancienttwitchwebostv.hls",
   "version": "1.0.0",
   "description": "SmartTwitchTV local HLS playlist service",
   "main": "hls_service.js",

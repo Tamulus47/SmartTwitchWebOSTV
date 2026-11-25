@@ -232,7 +232,7 @@ from Windows, change `HOST` to the TV IP and port stays 9998.
 | **Wrapper** | `webos/app/index.js` | The installed native-ish app window. Parses launch params, kicks the Homebrew startup script, starts `sttv_serve`, then navigates the window to the hosted URL. |
 | **Hosted app** | `release/` (from `app/` via `npm run hosted:prepare`) | The actual SmartTwitch UI/player, served from GitHub Pages. |
 | **Compat bridge** | `webos/bridge/webosCompatBridge.js` → `release/githubio/js/webosCompatBridge.js` | ES5 polyfills, playlist-fetch fallback, ad-free proxy chain, remux attach, `window.Android` API shape. **The two copies must stay byte-identical.** |
-| **Luna HLS service** | `webos/service/hls_service.js` (`com.tbsniller.smarttwitchwebostv.hls`) | The only working way to fetch playlists — the browser is blocked by CORS (§5.1). |
+| **Luna HLS service** | `webos/service/hls_service.js` (`com.tamulus.ancienttwitchwebostv.hls`) | The only working way to fetch playlists — the browser is blocked by CORS (§5.1). |
 | **Remux server** | `tools/tv-serve.js` → TV `/media/developer/sttv_stage/sttv_serve.js`, port **8099** | Transmuxes fMP4 → MPEG-TS in-process (own ISO-BMFF parser + TS muxer for node 0.12/ES5). |
 | **Homebrew service** | `/media/developer/apps/usr/palm/services/org.webosbrew.hbchannel.service/service.js` (minified) | Provides `autostart` (runs `startup.sh`) and `hb exec` (root command execution, used to spawn `sttv_serve`). |
 
@@ -245,7 +245,7 @@ App boot
 
 Master playlist fetch (usher.ttvnw.net)
   ├─ page XHR  → always fails (status 0 / 403 — no CORS, Origin rejected)
-  └─ luna service com.tbsniller.smarttwitchwebostv.hls  ✅ the working path
+  └─ luna service com.tamulus.ancienttwitchwebostv.hls  ✅ the working path
         └─ LIVE only: attemptAdfreeProxyChain()
              luminous bare template → rte prefix proxies → direct (last tier)
 
@@ -285,7 +285,7 @@ Format probe (per-variant)
 
 ### 4.1 What was broken and is now fixed
 
-A persistent activity **`com.tbsniller.smarttwitchwebostv.boot` (activityId 111)**, created
+A persistent activity **`com.tamulus.ancienttwitchwebostv.boot` (activityId 111)**, created
 during earlier SSH-bootstrap work, fired on `core-boot-done` every boot and launched the
 wrapper with `sttv_boot_kick: 1`. That produced the user-visible symptom:
 
@@ -294,7 +294,7 @@ wrapper with `sttv_boot_kick: 1`. That produced the user-visible symptom:
 
 **Fix:** cancelled it —
 `luna-send -n 1 luna://com.palm.activitymanager/cancel '{"activityId":111}'`
-Verified: `grep -ac 'NL_APP_LAUNCH_BEGIN.*smarttwitchwebostv' /var/log/messages` → `0` across a
+Verified: `grep -ac 'NL_APP_LAUNCH_BEGIN.*ancienttwitchwebostv' /var/log/messages` → `0` across a
 full reboot. Nothing re-creates it (the creation is not scripted anywhere in the repo).
 
 The wrapper's `sttv_boot_kick` branch in `webos/app/index.js` is now **dormant** and kept only
@@ -355,7 +355,7 @@ No playlist host sends CORS for our origin, so browser XHR is dead:
 - `usher.ttvnw.net` → status 0
 - `playlist.ttvnw.net` → 403 (rejects browser `Origin`)
 
-Only the packaged luna JS service `com.tbsniller.smarttwitchwebostv.hls` can fetch them.
+Only the packaged luna JS service `com.tamulus.ancienttwitchwebostv.hls` can fetch them.
 Bridge fixes: `serviceAttempted && !synthetic` guard (the doomed XHR's late status-0 event used
 to complete the request first → empty playlist → black screen), `USHER_PLAYLIST_SERVICE_COLD_GRACE_MS`
 cold-start grace + `warmUsherPlaylistService()` pre-spawn, one retry on timeout
@@ -513,10 +513,10 @@ luna-send -n 1 luna://org.webosbrew.hbchannel.service/autostart '{}'
 
 # reboot / launch
 luna-send -n 1 luna://com.webos.service.sleep/shutdown/machineReboot '{"reason":"remoteKey"}'
-luna-send -n 1 luna://com.webos.service.applicationManager/launch '{"id":"com.tbsniller.smarttwitchwebostv"}'
+luna-send -n 1 luna://com.webos.service.applicationManager/launch '{"id":"com.tamulus.ancienttwitchwebostv"}'
 ```
 
-Note: `grep -ac 'NL_APP_LAUNCH_BEGIN.*smarttwitchwebostv' /var/log/messages` is the canonical
+Note: `grep -ac 'NL_APP_LAUNCH_BEGIN.*ancienttwitchwebostv' /var/log/messages` is the canonical
 "did SmartTwitch auto-launch?" check — must be `0`.
 
 ### 8.3 Deploying the remux server

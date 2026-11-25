@@ -296,7 +296,7 @@
                 selfCloseBridge.onservicecallback = function () {};
                 selfCloseBridge.call(
                     'luna://com.webos.applicationManager/close',
-                    JSON.stringify({id: 'com.tbsniller.smarttwitchwebostv'})
+                    JSON.stringify({id: 'com.tamulus.ancienttwitchwebostv'})
                 );
             } catch (e) {}
         };

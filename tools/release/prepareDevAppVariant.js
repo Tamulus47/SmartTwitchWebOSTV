@@ -4,7 +4,7 @@ const path = require('path');
 const root = path.resolve(__dirname, '..', '..');
 const stableAppDir = path.join(root, 'webos', 'app');
 const defaultOutDir = path.join(root, '.tmp', 'dev-prerelease-app');
-const defaultTargetUrl = 'https://tbsniller.github.io/SmartTwitchWebOSTV/dev/index.html';
+const defaultTargetUrl = 'https://tamulus47.github.io/SmartTwitchWebOSTV/dev/index.html';
 const defaultIdSuffix = '.dev';
 const defaultVersionPrefix = '0.0.';
 

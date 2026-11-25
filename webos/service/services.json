@@ -1,9 +1,9 @@
 {
-  "id": "com.tbsniller.smarttwitchwebostv.hls",
+  "id": "com.tamulus.ancienttwitchwebostv.hls",
   "description": "SmartTwitchTV local HLS playlist service",
   "services": [
     {
-      "name": "com.tbsniller.smarttwitchwebostv.hls",
+      "name": "com.tamulus.ancienttwitchwebostv.hls",
       "description": "Fetches Twitch master playlists outside browser CORS limits",
       "commands": [
         {

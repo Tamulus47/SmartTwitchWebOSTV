@@ -45,7 +45,7 @@
 ### 2.2 Why Live Ads Are Still Showing
 
 1. **Luna Service Allowlist / Timeout Rejecting `as.luminous.dev` (`webos/service/hls_service.js`):**
-   - Browser XHR is blocked by CORS, so all playlists go through `com.tbsniller.smarttwitchwebostv.hls`.
+   - Browser XHR is blocked by CORS, so all playlists go through `com.tamulus.ancienttwitchwebostv.hls`.
    - The allowlist in `hls_service.js` was extended for `*.playlist.ttvnw.net` and any HTTPS `*.m3u8`.
    - However, the Tier 1 ad-free proxy URL is `https://as.luminous.dev/live/<channel>?...` — **its path does not end in `.m3u8` and its host is not `ttvnw.net`**. If `hls_service.js` rejects it (or if it times out over flaky WiFi), Tier 1 (`luminous`) fails, Tier 2 (`rte`) 404s, and Tier 3 (`direct` `usher.ttvnw.net`) succeeds — serving an unproxied master playlist with full ads.
 2. **`sourceFromQuality()` Bypassing Plan B When Quality or Bitrate Caps Apply:**
@@ -341,7 +341,7 @@ node tools/chrome38-apiscan.js      # Verify no new unguarded post-Chrome-38 run
    ```
 2. **If `webos/service/hls_service.js` was modified, update the installed Luna service on the TV (or rebuild and install the IPK):**
    ```bash
-   scp -P 22 webos/service/hls_service.js root@192.168.1.105:/media/developer/apps/usr/palm/services/com.tbsniller.smarttwitchwebostv.hls/hls_service.js
+   scp -P 22 webos/service/hls_service.js root@192.168.1.105:/media/developer/apps/usr/palm/services/com.tamulus.ancienttwitchwebostv.hls/hls_service.js
    ```
 3. **Commit and push `release/` (or point the wrapper `params.target` to a local dev server) so the TV loads the new `webosCompatBridge.js`.**
 

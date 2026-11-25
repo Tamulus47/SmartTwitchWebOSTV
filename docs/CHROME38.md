@@ -70,7 +70,7 @@ and are expected.
 None of the playlist hosts send CORS headers for our origin (`http://127.0.0.1:8099`), so a
 browser XHR to `usher.ttvnw.net` deterministically fails with status 0, and
 `playlist.ttvnw.net` actively rejects the browser `Origin` header (403). The only working path
-is the packaged luna JS service (`com.tbsniller.smarttwitchwebostv.hls`). The bridge had a race
+is the packaged luna JS service (`com.tamulus.ancienttwitchwebostv.hls`). The bridge had a race
 in its service fallback that caused intermittent black screens:
 
 | Problem | Fix (all in `webos/bridge/webosCompatBridge.js`) |
@@ -200,7 +200,7 @@ local remux server runs **only while the app is open**.
 ### SmartTwitch must not auto-launch
 
 An earlier SSH-bootstrap step created a *persistent* webOS activity
-`com.tbsniller.smarttwitchwebostv.boot` (activityId **111**) whose callback
+`com.tamulus.ancienttwitchwebostv.boot` (activityId **111**) whose callback
 launched the wrapper with `sttv_boot_kick: 1`. It fired on `core-boot-done` at
 every boot, so each boot flashed the SmartTwitch splash and then fell back to
 live TV. It has been **cancelled** and does not come back:
@@ -209,9 +209,9 @@ live TV. It has been **cancelled** and does not come back:
 luna-send -n 1 luna://com.palm.activitymanager/cancel '{"activityId":111}'
 ```
 
-Verified across a full reboot: `grep -ac 'NL_APP_LAUNCH_BEGIN.*smarttwitchwebostv'
+Verified across a full reboot: `grep -ac 'NL_APP_LAUNCH_BEGIN.*ancienttwitchwebostv'
 /var/log/messages` -> `0`, and no `NL_APP_LAUNCH` entry for
-`com.tbsniller.smarttwitchwebostv` at all. The wrapper's `sttv_boot_kick`
+`com.tamulus.ancienttwitchwebostv` at all. The wrapper's `sttv_boot_kick`
 branch (`webos/app/index.js`) is now dormant — nothing launches the wrapper
 with that param any more — and is kept only as an inert fallback.
 

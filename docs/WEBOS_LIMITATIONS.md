@@ -107,7 +107,7 @@ Reason:
 - Some webOS TV browser engines block cross-origin XHR to `https://usher.ttvnw.net/...m3u8` (CORS), even when direct media playback still works.
 
 Impact:
-- Bridge routes `usher` HLS master playlist fetches through local webOS JS service (`com.tbsniller.smarttwitchwebostv.hls`) instead of a proxy fallback.
+- Bridge routes `usher` HLS master playlist fetches through local webOS JS service (`com.tamulus.ancienttwitchwebostv.hls`) instead of a proxy fallback.
 - When playlist text is available, bridge parses variants and triggers quality refresh to keep UI options aligned with available tracks.
 
 ## Related Docs

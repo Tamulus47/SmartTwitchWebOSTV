@@ -158,7 +158,7 @@
         }
         return '/SmartTwitchWebOSTV';
     }
-    var FORK_BASE_URL = (w.location && w.location.origin ? w.location.origin : 'https://tbsniller.github.io') + detectRepoBasePath();
+    var FORK_BASE_URL = (w.location && w.location.origin ? w.location.origin : 'https://tamulus47.github.io') + detectRepoBasePath();
     var FORK_RELEASE_URL = FORK_BASE_URL + '/release/index.html';
     var FORK_VERSION_URL = FORK_BASE_URL + '/release/githubio/version/version.json';
     // --- Multi-stream warning state ---

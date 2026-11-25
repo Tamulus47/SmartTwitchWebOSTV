@@ -20,9 +20,9 @@ npm run release:artifacts
 ```
 
 Outputs:
-- `build/com.tbsniller.smarttwitchwebostv_<version>_all.ipk`
-- `build/com.tbsniller.smarttwitchwebostv.manifest.json`
-- `build/com.tbsniller.smarttwitchwebostv.apps-repo.yml`
+- `build/com.tamulus.ancienttwitchwebostv_<version>_all.ipk`
+- `build/com.tamulus.ancienttwitchwebostv.manifest.json`
+- `build/com.tamulus.ancienttwitchwebostv.apps-repo.yml`
 
 ## Device Operations
 
@@ -35,11 +35,11 @@ npm run webos:remove
 
 ## Release Artifacts
 - Homebrew metadata template source:
-  - `webos/homebrew/packages/com.tbsniller.smarttwitchwebostv.yml`
+  - `webos/homebrew/packages/com.tamulus.ancienttwitchwebostv.yml`
 - Artifact generation script:
   - `npm run release:artifacts`
 - Stable manifest URL contract:
-  - `https://github.com/TBSniller/SmartTwitchWebOSTV/releases/latest/download/com.tbsniller.smarttwitchwebostv.manifest.json`
+  - `https://github.com/Tamulus47/SmartTwitchWebOSTV/releases/latest/download/com.tamulus.ancienttwitchwebostv.manifest.json`
 
 ## GitHub Release Automation
 

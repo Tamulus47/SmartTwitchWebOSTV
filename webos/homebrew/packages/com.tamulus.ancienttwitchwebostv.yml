@@ -1,12 +1,12 @@
 title: SmartTwitchWebOSTV
-iconUri: https://raw.githubusercontent.com/TBSniller/SmartTwitchWebOSTV/master/release/githubio/images/icon_circle.png
-manifestUrl: https://github.com/TBSniller/SmartTwitchWebOSTV/releases/latest/download/com.tbsniller.smarttwitchwebostv.manifest.json
+iconUri: https://raw.githubusercontent.com/Tamulus47/SmartTwitchWebOSTV/master/release/githubio/images/icon_circle.png
+manifestUrl: https://github.com/Tamulus47/SmartTwitchWebOSTV/releases/latest/download/com.tamulus.ancienttwitchwebostv.manifest.json
 category: internet
 pool: main
 description: |
   SmartTwitchWebOSTV is a Twitch client for TV devices focused on a fast, remote-friendly experience. Originally developed as Android app by fgl27/SmartTwitchTV.
 
-  ![Screenshot](https://raw.githubusercontent.com/TBSniller/SmartTwitchWebOSTV/refs/heads/master/screenshot/SmartTV%20for%20Twitch_20200326_202509.png)
+  ![Screenshot](https://raw.githubusercontent.com/Tamulus47/SmartTwitchWebOSTV/refs/heads/master/screenshot/SmartTV%20for%20Twitch_20200326_202509.png)
 
   ## Features
   - Performance, performance, performance
@@ -23,4 +23,4 @@ description: |
   https://www.youtube.com/watch?v=PI2yrGb3pnY
 
   ## Source
-  https://github.com/TBSniller/SmartTwitchWebOSTV
+  https://github.com/Tamulus47/SmartTwitchWebOSTV

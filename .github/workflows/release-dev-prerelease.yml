@@ -71,7 +71,7 @@ jobs:
           node tools/release/prepareDevAppVariant.js \
             --out-dir .tmp/dev-app \
             --dev-number "${{ steps.version.outputs.dev_number }}" \
-            --target-url "https://tbsniller.github.io/SmartTwitchWebOSTV/dev/index.html"
+            --target-url "https://tamulus47.github.io/SmartTwitchWebOSTV/dev/index.html"
 
       - name: Prepare dev service variant
         run: |
@@ -112,7 +112,7 @@ jobs:
             Automated dev prerelease from `${{ github.ref_name }}`.
 
             - Prerelease tag: `${{ steps.version.outputs.dev_tag }}`
-            - Hosted app channel: `https://tbsniller.github.io/SmartTwitchWebOSTV/dev/index.html`
+            - Hosted app channel: `https://tamulus47.github.io/SmartTwitchWebOSTV/dev/index.html`
             - App id suffix: `.dev`
             - App version: `0.0.${{ steps.version.outputs.dev_number }}`
           artifacts: build/${{ steps.artifacts.outputs.ipk_name }},build/${{ steps.artifacts.outputs.manifest_name }}
