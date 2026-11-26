@@ -3898,12 +3898,27 @@
         '/media/developer/sttv_stage/sttv_serve.js 2>/dev/null | head -1); ' +
         '[ -n "$S" ] && nohup node "$S" 8099 >/dev/null 2>&1 &';
     var STTV_SERVE_STOP_CMD = "pkill -f 'sttv[_]serve' || true";
+    // Same Chrome 38 GC hazard as sttvServeOwn: keep the bridge referenced
+    // until the reply (or a short grace period) so the message is not lost.
+    var sttvServeExecPending = [];
     function sttvServeExec(command) {
         try {
             if (typeof w.PalmServiceBridge !== 'function') return false;
             var b = new w.PalmServiceBridge();
-            b.onservicecallback = function () {};
+            var done = false;
+            var release = function () {
+                if (done) return;
+                done = true;
+                var i = sttvServeExecPending.indexOf(b);
+                if (i >= 0) sttvServeExecPending.splice(i, 1);
+            };
+            b.onservicecallback = function () { release(); };
+            b.onserviceerror = function () { release(); };
+            sttvServeExecPending.push(b);
             b.call('luna://org.webosbrew.hbchannel.service/exec', JSON.stringify({command: command}));
+            // The hb service may never answer on a non-rooted TV - do not hold
+            // the reference forever.
+            w.setTimeout(release, 15000);
             return true;
         } catch (e) {
             bridgeDebugLog('sttv_serve_exec_error', {error: String(e)});
@@ -3914,14 +3929,25 @@
     // with child_process - no Homebrew Channel, no rooted TV. Anything that
     // does not come back positively (service missing, sandboxed spawn, start
     // timeout) falls back to the legacy root exec above.
+    //
+    // Chrome 38 GCs a PalmServiceBridge whose JS side holds no reference before
+    // the Luna reply arrives; the call then dies with "Message status unknown"
+    // and the fallback (root exec) is what actually runs - which fails on a
+    // non-rooted TV. Keep every in-flight bridge in this list until it settles.
+    var sttvServeOwnPending = [];
     function sttvServeOwn(method, fallbackCommand, isOk) {
         try {
             if (typeof w.PalmServiceBridge !== 'function') return false;
             var b = new w.PalmServiceBridge();
             var settled = false;
+            var release = function () {
+                var i = sttvServeOwnPending.indexOf(b);
+                if (i >= 0) sttvServeOwnPending.splice(i, 1);
+            };
             var fallBack = function () {
                 if (settled) return;
                 settled = true;
+                release();
                 sttvServeExec(fallbackCommand);
             };
             b.onservicecallback = function (msg) {
@@ -3930,12 +3956,23 @@
                 try { parsed = typeof msg === 'string' ? JSON.parse(msg) : msg; } catch (eParse) {}
                 if (isOk(parsed)) {
                     settled = true;
+                    release();
                 } else {
                     fallBack();
                 }
             };
             b.onserviceerror = fallBack;
+            sttvServeOwnPending.push(b);
             b.call(STTV_SERVE_SERVICE + method, '{}');
+            // If the service never answers (stopped, crash), release the
+            // reference after a grace period instead of leaking it.
+            w.setTimeout(function () {
+                if (!settled) {
+                    settled = true;
+                    release();
+                    bridgeDebugLog('sttv_serve_own_timeout', {method: method});
+                }
+            }, 20000);
             return true;
         } catch (e) {
             bridgeDebugLog('sttv_serve_own_error', {error: String(e)});

@@ -264,6 +264,15 @@
     // the boot chain.
     var serveExecBridge = null;
     var serveOwnBridge = null;
+    // Chrome 38 GCs a PalmServiceBridge that no JS variable references before
+    // its Luna reply arrives ("Message status unknown"), which silently
+    // downgrades this to the root-exec fallback. Keep in-flight bridges here
+    // until they settle (see bridge sttvServeOwn for the same fix).
+    var serveOwnPending = [];
+    function serveOwnRelease(b) {
+        var i = serveOwnPending.indexOf(b);
+        if (i >= 0) serveOwnPending.splice(i, 1);
+    }
     // Fallback ONLY: Homebrew Channel's root `exec`. The primary path is the
     // app's own service (ensureSttvServe below), which needs no rooted TV.
     // The command looks for the script bundled inside the service package
@@ -286,24 +295,40 @@
         try {
             if (typeof global.PalmServiceBridge !== 'function') return;
             var settled = false;
-            serveOwnBridge = new global.PalmServiceBridge();
+            var b = new global.PalmServiceBridge();
+            serveOwnBridge = b; // retained until the next call replaces it
+            serveOwnPending.push(b);
+            var release = function () {
+                if (settled) return;
+                settled = true;
+                serveOwnRelease(b);
+            };
             var fallBack = function () {
                 if (settled) return;
                 settled = true;
+                serveOwnRelease(b);
                 sttvServeExecFallback();
             };
-            serveOwnBridge.onservicecallback = function (msg) {
+            b.onservicecallback = function (msg) {
                 if (settled) return;
                 var parsed = null;
                 try { parsed = typeof msg === 'string' ? JSON.parse(msg) : msg; } catch (eParse) {}
                 if (parsed && parsed.returnValue && parsed.running) {
-                    settled = true;
+                    release();
                 } else {
                     fallBack();
                 }
             };
-            serveOwnBridge.onserviceerror = fallBack;
-            serveOwnBridge.call('luna://com.tamulus.ancienttwitchwebostv.hls/startRemux', '{}');
+            b.onserviceerror = fallBack;
+            b.call('luna://com.tamulus.ancienttwitchwebostv.hls/startRemux', '{}');
+            // Bounded hold: a silent service must not leak the reference.
+            global.setTimeout(function () {
+                if (!settled) {
+                    settled = true;
+                    serveOwnRelease(b);
+                    debugLog('sttv_serve_ensure_timeout', {});
+                }
+            }, 20000);
             debugLog('sttv_serve_ensure', {via: 'own_service'});
         } catch (e) {
             debugLog('sttv_serve_ensure_error', {error: String(e)});
