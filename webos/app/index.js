@@ -263,23 +263,48 @@
     // by the bridge's unload hook when the app closes, and never started by
     // the boot chain.
     var serveExecBridge = null;
+    var serveOwnBridge = null;
+    // Fallback ONLY: Homebrew Channel's root `exec`. The primary path is the
+    // app's own service (ensureSttvServe below), which needs no rooted TV.
+    // The command looks for the script bundled inside the service package
+    // first, so it also works on a fresh install.
+    var STTV_SERVE_START_CMD =
+        "netstat -ltn 2>/dev/null | grep -q ':8099' || " +
+        'S=$(ls /media/developer/apps/usr/palm/services/com.tamulus.ancienttwitchwebostv.hls/sttv_serve.js ' +
+        '/media/cryptofs/apps/usr/palm/services/com.tamulus.ancienttwitchwebostv.hls/sttv_serve.js ' +
+        '/media/developer/sttv_stage/sttv_serve.js 2>/dev/null | head -1); ' +
+        '[ -n "$S" ] && nohup node "$S" 8099 >/dev/null 2>&1 &';
+    function sttvServeExecFallback() {
+        serveExecBridge = new global.PalmServiceBridge();
+        serveExecBridge.onservicecallback = function () {};
+        serveExecBridge.call(
+            'luna://org.webosbrew.hbchannel.service/exec',
+            JSON.stringify({command: STTV_SERVE_START_CMD})
+        );
+    }
     function ensureSttvServe() {
         try {
             if (typeof global.PalmServiceBridge !== 'function') return;
-            serveExecBridge = new global.PalmServiceBridge();
-            serveExecBridge.onservicecallback = function () {};
-            // Port-based guard, NOT `pgrep -f sttv_serve.js`: hb exec runs
-            // this as /bin/sh -c, whose own cmdline contains the script name
-            // - pgrep would match the shell and skip the nohup branch.
-            serveExecBridge.call(
-                'luna://org.webosbrew.hbchannel.service/exec',
-                JSON.stringify({
-                    command:
-                        "netstat -ltn 2>/dev/null | grep -q ':8099' || " +
-                        '(cd /media/developer/sttv_stage && nohup node sttv_serve.js 8099 >/dev/null 2>&1 &)'
-                })
-            );
-            debugLog('sttv_serve_ensure', {});
+            var settled = false;
+            serveOwnBridge = new global.PalmServiceBridge();
+            var fallBack = function () {
+                if (settled) return;
+                settled = true;
+                sttvServeExecFallback();
+            };
+            serveOwnBridge.onservicecallback = function (msg) {
+                if (settled) return;
+                var parsed = null;
+                try { parsed = typeof msg === 'string' ? JSON.parse(msg) : msg; } catch (eParse) {}
+                if (parsed && parsed.returnValue && parsed.running) {
+                    settled = true;
+                } else {
+                    fallBack();
+                }
+            };
+            serveOwnBridge.onserviceerror = fallBack;
+            serveOwnBridge.call('luna://com.tamulus.ancienttwitchwebostv.hls/startRemux', '{}');
+            debugLog('sttv_serve_ensure', {via: 'own_service'});
         } catch (e) {
             debugLog('sttv_serve_ensure_error', {error: String(e)});
         }

@@ -10,9 +10,19 @@
           "name": "fetchPlaylist",
           "description": "Fetch an usher playlist and return its M3U8 body",
           "public": true
+        },
+        {
+          "name": "startRemux",
+          "description": "Start the bundled local fMP4->TS remux server on port 8099",
+          "public": true
+        },
+        {
+          "name": "stopRemux",
+          "description": "Stop the local remux server",
+          "public": true
         }
       ]
     }
   ],
-  "version": "1.1.0"
+  "version": "1.1.1"
 }

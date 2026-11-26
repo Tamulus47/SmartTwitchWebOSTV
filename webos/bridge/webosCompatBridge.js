@@ -3886,9 +3886,17 @@
     // guard therefore checks the listening port instead (netstat output has
     // no cmdline collision), and stop uses the bracket trick so pkill cannot
     // match its own shell.
+    var STTV_SERVE_SERVICE = 'luna://com.tamulus.ancienttwitchwebostv.hls/';
+    // Fallback ONLY: Homebrew Channel's root `exec`. The primary path is the
+    // app's own service (sttvServeOwn below), which needs no rooted TV. The
+    // command locates the bundled script first and only falls back to the old
+    // root-deployed copy, so it also works on a fresh install.
     var STTV_SERVE_START_CMD =
         "netstat -ltn 2>/dev/null | grep -q ':8099' || " +
-        '(cd /media/developer/sttv_stage && nohup node sttv_serve.js 8099 >/dev/null 2>&1 &)';
+        'S=$(ls /media/developer/apps/usr/palm/services/com.tamulus.ancienttwitchwebostv.hls/sttv_serve.js ' +
+        '/media/cryptofs/apps/usr/palm/services/com.tamulus.ancienttwitchwebostv.hls/sttv_serve.js ' +
+        '/media/developer/sttv_stage/sttv_serve.js 2>/dev/null | head -1); ' +
+        '[ -n "$S" ] && nohup node "$S" 8099 >/dev/null 2>&1 &';
     var STTV_SERVE_STOP_CMD = "pkill -f 'sttv[_]serve' || true";
     function sttvServeExec(command) {
         try {
@@ -3902,10 +3910,52 @@
             return false;
         }
     }
+    // Primary path: the app's own Luna service spawns the bundled remux server
+    // with child_process - no Homebrew Channel, no rooted TV. Anything that
+    // does not come back positively (service missing, sandboxed spawn, start
+    // timeout) falls back to the legacy root exec above.
+    function sttvServeOwn(method, fallbackCommand, isOk) {
+        try {
+            if (typeof w.PalmServiceBridge !== 'function') return false;
+            var b = new w.PalmServiceBridge();
+            var settled = false;
+            var fallBack = function () {
+                if (settled) return;
+                settled = true;
+                sttvServeExec(fallbackCommand);
+            };
+            b.onservicecallback = function (msg) {
+                if (settled) return;
+                var parsed = null;
+                try { parsed = typeof msg === 'string' ? JSON.parse(msg) : msg; } catch (eParse) {}
+                if (isOk(parsed)) {
+                    settled = true;
+                } else {
+                    fallBack();
+                }
+            };
+            b.onserviceerror = fallBack;
+            b.call(STTV_SERVE_SERVICE + method, '{}');
+            return true;
+        } catch (e) {
+            bridgeDebugLog('sttv_serve_own_error', {error: String(e)});
+            return false;
+        }
+    }
     function ensureSttvServe() {
+        if (sttvServeOwn('startRemux', STTV_SERVE_START_CMD, function (r) {
+            return !!(r && r.returnValue && r.running);
+        })) {
+            return true;
+        }
         return sttvServeExec(STTV_SERVE_START_CMD);
     }
     function stopSttvServe() {
+        if (sttvServeOwn('stopRemux', STTV_SERVE_STOP_CMD, function (r) {
+            return !!(r && r.returnValue);
+        })) {
+            return true;
+        }
         return sttvServeExec(STTV_SERVE_STOP_CMD);
     }
     // Heartbeat: while this app page is alive, ping /health every 10s. The

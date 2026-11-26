@@ -10,6 +10,9 @@ var pkgInfo = require('./package.json');
 var Service = require('webos-service');
 var https = require('https');
 var urlLib = require('url');
+var childProcess = require('child_process');
+var httpMod = require('http');
+var pathMod = require('path');
 
 var service = new Service(pkgInfo.name);
 
@@ -238,6 +241,131 @@ service.register('fetchPlaylist', function (message) {
     };
     startRequest();
 });
+
+// ---------------------------------------------------------------------------
+// Local fMP4 -> MPEG-TS remux server (sttv_serve.js, port 8099).
+//
+// This used to be started through Homebrew Channel's root `exec`, which made
+// the app depend on a rooted TV. The script now ships inside this package and
+// is spawned here with child_process instead. The server itself needs no
+// privileges at all: it binds an unprivileged port (8099 > 1024), only reads
+// its own script, and logs to world-writable /tmp - verified on device
+// running as uid 5570 with its old document root completely absent.
+// ---------------------------------------------------------------------------
+var REMUX_PORT = 8099;
+var REMUX_SCRIPT = pathMod.join(__dirname, 'sttv_serve.js');
+var REMUX_HEALTH_TIMEOUT_MS = 2000;
+var REMUX_START_SETTLE_MS = 1500;
+
+function probeRemux(callback) {
+    var done = false;
+    var finish = function (ok) {
+        if (done) return;
+        done = true;
+        callback(!!ok);
+    };
+    var req;
+    try {
+        req = httpMod.get({host: '127.0.0.1', port: REMUX_PORT, path: '/health'}, function (res) {
+            var body = '';
+            res.on('data', function (chunk) { body += chunk; });
+            res.on('end', function () {
+                finish(res.statusCode === 200 && body.indexOf('ok') !== -1);
+            });
+            res.on('error', function () { finish(false); });
+        });
+    } catch (eProbe) {
+        finish(false);
+        return;
+    }
+    req.setTimeout(REMUX_HEALTH_TIMEOUT_MS, function () {
+        try { req.abort(); } catch (eAbort) {}
+        finish(false);
+    });
+    req.on('error', function () { finish(false); });
+}
+
+function spawnRemux() {
+    var child = childProcess.spawn('node', [REMUX_SCRIPT, String(REMUX_PORT)], {
+        cwd: pathMod.dirname(REMUX_SCRIPT),
+        detached: true,
+        stdio: 'ignore'
+    });
+    child.unref();
+    return child.pid;
+}
+
+service.register('startRemux', function (message) {
+    probeRemux(function (alreadyRunning) {
+        if (alreadyRunning) {
+            message.respond({
+                returnValue: true,
+                running: true,
+                alreadyRunning: true,
+                port: REMUX_PORT
+            });
+            return;
+        }
+
+        var pid = 0;
+        var spawnError = '';
+        try {
+            pid = spawnRemux();
+        } catch (eSpawn) {
+            spawnError = String(eSpawn && eSpawn.message ? eSpawn.message : eSpawn);
+        }
+
+        if (!pid) {
+            message.respond({
+                returnValue: false,
+                status: 500,
+                errorCode: 'SPAWN_FAILED',
+                errorText: spawnError || 'Could not spawn the remux server',
+                script: REMUX_SCRIPT
+            });
+            return;
+        }
+
+        setTimeout(function () {
+            probeRemux(function (ok) {
+                var response = {
+                    returnValue: !!ok,
+                    status: ok ? 200 : 500,
+                    running: !!ok,
+                    pid: pid,
+                    port: REMUX_PORT,
+                    script: REMUX_SCRIPT
+                };
+                if (typeof process.getuid === 'function') response.serviceUid = process.getuid();
+                if (!ok) {
+                    response.errorCode = 'START_TIMEOUT';
+                    response.errorText = 'Remux server did not answer /health after spawn';
+                }
+                message.respond(response);
+            });
+        }, REMUX_START_SETTLE_MS);
+    });
+});
+
+service.register('stopRemux', function (message) {
+    // Bracket trick keeps pkill from matching the shell it runs in.
+    try {
+        var killer = childProcess.spawn('pkill', ['-f', 'sttv[_]serve'], {stdio: 'ignore'});
+        killer.on('error', function () {});
+        killer.unref();
+    } catch (eKill) {}
+
+    setTimeout(function () {
+        probeRemux(function (stillRunning) {
+            message.respond({
+                returnValue: true,
+                running: !!stillRunning,
+                port: REMUX_PORT
+            });
+        });
+    }, 700);
+});
+
 
 
 
