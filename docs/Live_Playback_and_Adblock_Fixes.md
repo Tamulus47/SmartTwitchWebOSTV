@@ -322,6 +322,48 @@ function sanitizeLiveVariantPlaylist(m3u8Text) {
 
 ---
 
+### Fix D: `webos/bridge/webosCompatBridge.js` — Default "Auto" Quality to 480p for Live **and** VOD
+
+**Symptom:** the decoder cannot render full HD. Any attach that resolves to a
+`1920x1080` variant freezes playback, so streams and VODs must *start* at 480p.
+
+**Root cause:** `sourceFromQuality()` only capped the live path (`LIVE_MAX_HEIGHT`,
+Fix B). The VOD path had no cap at all, so it either handed the master playlist
+to native ABR (which climbs to 1080p) or — when `res_max` is at its shipped
+"default" of `2160p`, i.e. `mainMaxRes = 2170` — ran `pickFromMaster()` with a
+2170-pixel ceiling and picked the 1080p rung directly. The format probe had the
+same hole (`cap = mainMaxRes > 0 ? mainMaxRes : MSE_DEFAULT_MAX_RES`).
+
+**Fix (all in `webos/bridge/webosCompatBridge.js`):**
+
+1. New constant next to the live ceiling:
+   ```javascript
+   var DEFAULT_MAX_HEIGHT = 480;
+   ```
+2. In `sourceFromQuality()`, after the live block:
+   ```javascript
+   if (!capRes || capRes > DEFAULT_MAX_HEIGHT) capRes = DEFAULT_MAX_HEIGHT;
+   ```
+   A *lower* `res_max` / `bitrate_main` cap still wins; an explicit OSD quality
+   pick (`state.qp >= 0`, returned at the top of the function) is never affected.
+3. The direct (non-proxy) branch now attaches a concrete `<= 480p` variant
+   instead of the master playlist, so native ABR cannot climb to 1080p.
+   `pickFromMaster()` falls back to the lowest available rung when nothing fits
+   the cap, so source-only channels still play.
+4. The format probe clamps its variant choice:
+   ```javascript
+   var cap = mainMaxRes > 0 && mainMaxRes < MSE_DEFAULT_MAX_RES ? mainMaxRes : MSE_DEFAULT_MAX_RES;
+   ```
+   and the MPEG-TS branch re-attaches the probed variant when `ms.uri` is still
+   the master (the empty-ladder fallback) instead of leaving native ABR on it.
+
+**What is deliberately *not* changed:** the quality OSD still lists every
+variant (`state.q` / `filterLiveQualities()` still allow up to 720p for live and
+the full ladder for VOD), so 720p/1080p remain one click away for anyone who
+wants them. Only the *starting* pick is 480p.
+
+---
+
 ## 5. Step 3: Mandatory Quality Gates & Deployment
 
 After editing the files, run all verification gates in order before deploying or committing:
@@ -348,9 +390,10 @@ node tools/chrome38-apiscan.js      # Verify no new unguarded post-Chrome-38 run
 ### 5.3 On-Device Acceptance Verification
 Launch a live stream inside the SmartTwitch wrapper on the TV and verify via `node tvcdp.js`:
 1. `adfree_proxy_success tier:luminous` is logged in CDP console.
-2. `main_source_selected` logs `proxyMaster: true` and attaches a variant `<= 1280x720`.
+2. `main_source_selected` logs `proxyMaster: true` and attaches a variant `<= 1280x720` (Fix D: the *default* pick is `<= 480`).
 3. Sample `video.currentTime`, `video.readyState`, and `video.videoHeight` every 5 seconds over 2 minutes:
-   - `videoHeight` must be `<= 720`.
+   - With quality left on **Auto**, `videoHeight` must start at `480` (Fix D) and never exceed `720`.
    - `readyState` must hold steady at `4` (`HAVE_ENOUGH_DATA`).
    - `currentTime` must advance continuously (0s → 60s+) with zero 1-frame spinner loops and zero ads.
-4. Re-verify a known fMP4 VOD (e.g. Pisty VOD `2919603413`) to confirm no regression in VOD playback.
+4. Re-verify a known fMP4 VOD (e.g. Pisty VOD `2919603413`) to confirm no regression in VOD playback, and that a fresh VOD start also reports `videoHeight === 480` on Auto.
+5. Open the quality OSD on both a live stream and a VOD: every rung (up to 720p live / source VOD) must still be listed and selectable — only the starting pick is capped.

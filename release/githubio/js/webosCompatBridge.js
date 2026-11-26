@@ -126,6 +126,15 @@
     // See docs/Live_Playback_and_Adblock_Fixes.md (Fix B).
     var LIVE_MAX_HEIGHT = 720;
     var LIVE_MAX_BANDWIDTH = 3500000;
+    // --- Default automatic quality (Fix D) ---
+    // The decoder cannot render full HD at all: any 1080p attach freezes
+    // playback outright, for VODs just as much as for live. Auto quality
+    // therefore starts at DEFAULT_MAX_HEIGHT for streams and VODs alike.
+    // This only sets the *starting* pick: the OSD quality menu still lists
+    // every variant in state.q, an explicit pick (state.qp >= 0) bypasses this
+    // cap entirely, and a lower res_max/bitrate_main cap from settings still
+    // wins. Raise the constant to change what "Auto" starts at.
+    var DEFAULT_MAX_HEIGHT = 480;
     // Play.js OSInterface_StartAuto who_called: 1 = live, 2 = VOD, 3 = clip.
     function isLiveStreamState(state) {
         return !!state && state.type !== 2 && state.type !== 3;
@@ -2642,8 +2651,7 @@
             list = parseQ(lastProxiedMasterBody, lastProxiedMasterUrl || state.rawUri);
         }
         // Live quality ceiling (Fix B.1): cap the single-variant pick at
-        // 720p / 3.5 Mbps and prefer 30fps. VOD/clip and the direct-master
-        // attach path (native ABR) are untouched.
+        // 720p / 3.5 Mbps and prefer 30fps.
         var live = isLiveStreamState(state);
         var capRes = maxRes > 0 ? maxRes : 0;
         var capBw = state === ms && mainMaxBitrate > 0 ? mainMaxBitrate : 0;
@@ -2653,6 +2661,11 @@
             if (!capBw || capBw > LIVE_MAX_BANDWIDTH) capBw = LIVE_MAX_BANDWIDTH;
             preferLowFps = true;
         }
+        // Default automatic quality (Fix D): Auto starts at DEFAULT_MAX_HEIGHT
+        // for live *and* VOD - a 1080p attach freezes this decoder. A lower
+        // user cap (res_max / bitrate_main) still wins; an explicit OSD quality
+        // pick is handled at the top of this function and is never affected.
+        if (!capRes || capRes > DEFAULT_MAX_HEIGHT) capRes = DEFAULT_MAX_HEIGHT;
         if (state.rawUri && (!maxRes || maxRes <= 0) && (!capBw || !hasProxyMaster)) {
             // Plan B: never hand the platform media stack a proxy-host master
             // URL (as.luminous.dev / rte prefix proxies) - its native fetch of
@@ -2666,9 +2679,20 @@
             if (hasProxyMaster) {
                 var adfreeVariant = pickFromMaster(state.rawUri, list, capRes, capBw, preferLowFps);
                 if (adfreeVariant && adfreeVariant !== state.rawUri) return adfreeVariant;
+            } else if (list && list.length) {
+                // Direct flow: attach a concrete <=DEFAULT_MAX_HEIGHT variant
+                // instead of the master. Handing the master to native ABR lets
+                // the platform climb to 1080p, which freezes the decoder - and
+                // the local sanitizer only strips 1080p from *live* masters, so
+                // VOD in particular would play full HD. pickFromMaster falls
+                // back to the lowest available rung when nothing fits the cap,
+                // so a source-only channel still plays.
+                var directVariant = pickFromMaster(state.rawUri, list, capRes, capBw, preferLowFps);
+                if (directVariant && directVariant !== state.rawUri) return directVariant;
             }
-            // Direct flow: attach the master URL itself so the platform's own
-            // native ABR picks a variant (never a proxy-host URL here).
+            // No usable ladder at all: attach the master URL itself so the
+            // platform's own native ABR picks *something* playable (never a
+            // proxy-host URL here - the branch above already returned one).
             return state.rawUri;
         }
         return pickFromMaster(state.rawUri, list, capRes, capBw, preferLowFps);
@@ -4196,7 +4220,10 @@
                         // than the app's start watchdog allows, while a low
                         // variant starts in seconds (native ABR also ramps up
                         // from a low variant). SetQuality upgrades later.
-                        var cap = mainMaxRes > 0 ? mainMaxRes : MSE_DEFAULT_MAX_RES;
+                        // Never let a (default/unlimited) res_max setting push
+                        // this past MSE_DEFAULT_MAX_RES - a 1080p probe attach
+                        // freezes the decoder (Fix D).
+                        var cap = mainMaxRes > 0 && mainMaxRes < MSE_DEFAULT_MAX_RES ? mainMaxRes : MSE_DEFAULT_MAX_RES;
                         var pick = null;
                         var qi2;
                         for (qi2 = 0; qi2 < q.length; qi2++) {
@@ -4224,6 +4251,17 @@
                 } else {
                     mainStreamFormat = 'ts';
                     bridgeDebugLog('mse_probe_ts', {segs: parsed.segs.length});
+                    // The probe only resolves a *master* down to a variant when
+                    // sourceFromQuality had no parsed ladder to pick from. In
+                    // that case ms.uri is still the master and native ABR would
+                    // climb to 1080p (freezes the decoder) - re-attach the
+                    // probed variant instead. Normal playback already has
+                    // ms.uri === probeUrl, so this never reloads a playing
+                    // stream.
+                    if (ms.uri !== probeUrl) {
+                        ms.uri = probeUrl;
+                        attachNativeMain();
+                    }
                 }
             });
         };
