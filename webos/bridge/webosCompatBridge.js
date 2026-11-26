@@ -3934,16 +3934,26 @@
     // the Luna reply arrives; the call then dies with "Message status unknown"
     // and the fallback (root exec) is what actually runs - which fails on a
     // non-rooted TV. Keep every in-flight bridge in this list until it settles.
+    //
+    // Message delivery is also occasionally lost outright (observed on device:
+    // the call is issued, no reply ever comes, the server keeps running), so a
+    // silent call is re-issued a couple of times before falling back. Both
+    // commands are idempotent (start checks the port, stop is a pkill).
     var sttvServeOwnPending = [];
     try { w.__sttvServeOwnV = 2; } catch (eVer) {}
-    function sttvServeOwn(method, fallbackCommand, isOk) {
+    var STTV_SERVE_OWN_RETRY_MS = 3000;
+    var STTV_SERVE_OWN_RETRIES = 2;
+    function sttvServeOwn(method, fallbackCommand, isOk, attempt) {
+        var tryNo = attempt || 0;
         try {
             if (typeof w.PalmServiceBridge !== 'function') return false;
             var b = new w.PalmServiceBridge();
             var settled = false;
+            var timer = 0;
             var release = function () {
                 var i = sttvServeOwnPending.indexOf(b);
                 if (i >= 0) sttvServeOwnPending.splice(i, 1);
+                if (timer) w.clearTimeout(timer);
             };
             var fallBack = function () {
                 if (settled) return;
@@ -3965,15 +3975,22 @@
             b.onserviceerror = fallBack;
             sttvServeOwnPending.push(b);
             b.call(STTV_SERVE_SERVICE + method, '{}');
-            // If the service never answers (stopped, crash), release the
-            // reference after a grace period instead of leaking it.
-            w.setTimeout(function () {
-                if (!settled) {
-                    settled = true;
-                    release();
-                    bridgeDebugLog('sttv_serve_own_timeout', {method: method});
+            // No reply within the retry window = the message was probably lost.
+            // Re-issue (idempotent) while retries remain, else give up on the
+            // own-service path. The final release happens either way so a
+            // silent service cannot leak the reference.
+            timer = w.setTimeout(function () {
+                if (settled) return;
+                settled = true;
+                release();
+                if (tryNo < STTV_SERVE_OWN_RETRIES) {
+                    bridgeDebugLog('sttv_serve_own_retry', {method: method, attempt: tryNo + 1});
+                    sttvServeOwn(method, fallbackCommand, isOk, tryNo + 1);
+                } else {
+                    bridgeDebugLog('sttv_serve_own_giveup', {method: method});
+                    sttvServeExec(fallbackCommand);
                 }
-            }, 20000);
+            }, STTV_SERVE_OWN_RETRY_MS);
             return true;
         } catch (e) {
             bridgeDebugLog('sttv_serve_own_error', {error: String(e)});

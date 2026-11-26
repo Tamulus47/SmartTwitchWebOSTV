@@ -269,6 +269,7 @@
     // downgrades this to the root-exec fallback. Keep in-flight bridges here
     // until they settle (see bridge sttvServeOwn for the same fix).
     var serveOwnPending = [];
+    var serveOwnRetried = false;
     function serveOwnRelease(b) {
         var i = serveOwnPending.indexOf(b);
         if (i >= 0) serveOwnPending.splice(i, 1);
@@ -314,6 +315,7 @@
                 var parsed = null;
                 try { parsed = typeof msg === 'string' ? JSON.parse(msg) : msg; } catch (eParse) {}
                 if (parsed && parsed.returnValue && parsed.running) {
+                    serveOwnRetried = false; // healthy again: re-arm the retry
                     release();
                 } else {
                     fallBack();
@@ -321,14 +323,22 @@
             };
             b.onserviceerror = fallBack;
             b.call('luna://com.tamulus.ancienttwitchwebostv.hls/startRemux', '{}');
-            // Bounded hold: a silent service must not leak the reference.
+            // Luna replies can be lost outright (observed on device): re-issue
+            // once after 3s, then release the reference either way so a silent
+            // service cannot leak it. The bridge's own ensure/heartbeat covers
+            // any later restarts.
             global.setTimeout(function () {
-                if (!settled) {
-                    settled = true;
-                    serveOwnRelease(b);
+                if (settled) return;
+                settled = true;
+                serveOwnRelease(b);
+                if (!serveOwnRetried) {
+                    serveOwnRetried = true;
+                    debugLog('sttv_serve_ensure_retry', {});
+                    ensureSttvServe();
+                } else {
                     debugLog('sttv_serve_ensure_timeout', {});
                 }
-            }, 20000);
+            }, 3000);
             debugLog('sttv_serve_ensure', {via: 'own_service'});
         } catch (e) {
             debugLog('sttv_serve_ensure_error', {error: String(e)});
