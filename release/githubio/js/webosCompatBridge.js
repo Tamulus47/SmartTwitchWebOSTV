@@ -3935,6 +3935,7 @@
     // and the fallback (root exec) is what actually runs - which fails on a
     // non-rooted TV. Keep every in-flight bridge in this list until it settles.
     var sttvServeOwnPending = [];
+    try { w.__sttvServeOwnV = 2; } catch (eVer) {}
     function sttvServeOwn(method, fallbackCommand, isOk) {
         try {
             if (typeof w.PalmServiceBridge !== 'function') return false;

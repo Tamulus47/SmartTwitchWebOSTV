@@ -13,6 +13,16 @@ var urlLib = require('url');
 var childProcess = require('child_process');
 var httpMod = require('http');
 var pathMod = require('path');
+var fsMod = require('fs');
+
+// Diagnostic breadcrumb: append each received command to /tmp/svc.log so we
+// can tell "message never arrived" from "reply got lost" during on-device
+// lifecycle testing. Harmless in production (world-writable /tmp).
+function svcLog(method) {
+    try {
+        fsMod.appendFileSync('/tmp/svc.log', Date.now() + ' ' + method + '\n');
+    } catch (eSvcLog) {}
+}
 
 var service = new Service(pkgInfo.name);
 
@@ -296,6 +306,7 @@ function spawnRemux() {
 }
 
 service.register('startRemux', function (message) {
+    svcLog('startRemux');
     probeRemux(function (alreadyRunning) {
         if (alreadyRunning) {
             message.respond({
@@ -348,6 +359,7 @@ service.register('startRemux', function (message) {
 });
 
 service.register('stopRemux', function (message) {
+    svcLog('stopRemux');
     // Bracket trick keeps pkill from matching the shell it runs in.
     try {
         var killer = childProcess.spawn('pkill', ['-f', 'sttv[_]serve'], {stdio: 'ignore'});
@@ -357,6 +369,7 @@ service.register('stopRemux', function (message) {
 
     setTimeout(function () {
         probeRemux(function (stillRunning) {
+            svcLog('stopRemux.respond running=' + stillRunning);
             message.respond({
                 returnValue: true,
                 running: !!stillRunning,
